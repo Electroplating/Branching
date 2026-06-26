@@ -1,0 +1,104 @@
+"""``SolveBackend`` 的 z3 实现（adapter 层，集中所有 z3 依赖）。
+
+通过 z3 的公开 Python API 提供 GOMT calculus 所需的 ``Solve`` / ``Optimize`` 与
+公式代数。**不修改、不依赖系统 z3 二进制**，仅用 pip 安装的 ``z3-solver`` wheel
+（与系统 ``/usr/local/bin/z3`` 版本一致，互不影响）。
+"""
+
+from __future__ import annotations
+
+from fractions import Fraction
+from typing import Optional
+
+import z3
+
+from omt_branching.solver.interfaces import Sense
+
+
+class Unbounded(Exception):
+    """目标在某 branch 上无界（v1 不处理无界优化）。"""
+
+
+class Z3Backend:
+    """以 z3 公开 API 实现的 ``SolveBackend``。"""
+
+    def __init__(self, eps: float = 1e-9):
+        self.eps = eps
+
+    # ---------------- 求解 ----------------
+    def solve(self, constraint) -> Optional[z3.ModelRef]:
+        s = z3.Solver()
+        s.add(constraint)
+        return s.model() if s.check() == z3.sat else None
+
+    def optimize(self, constraint, objective, sense: Sense):
+        o = z3.Optimize()
+        o.add(constraint)
+        if sense is Sense.MIN:
+            o.minimize(objective)
+        else:
+            o.maximize(objective)
+        if o.check() != z3.sat:
+            return None
+        m = o.model()
+        # 用最优 model 上的目标取值作为最优值（LIA/LRA 闭最优时即为 bound，
+        # 且避免 lower/upper 返回 epsilon/oo 表达式带来的解析问题）。
+        return m, self.value(m, objective)
+
+    # ---------------- 取值 ----------------
+    def value(self, model, term):
+        return self._num(model.eval(term, model_completion=True))
+
+    def is_true(self, model, atom) -> bool:
+        return z3.is_true(model.eval(atom, model_completion=True))
+
+    # ---------------- 公式代数 ----------------
+    def conjoin(self, *constraints):
+        if not constraints:
+            return z3.BoolVal(True)
+        if len(constraints) == 1:
+            return constraints[0]
+        return z3.And(*constraints)
+
+    def negate(self, constraint):
+        return z3.Not(constraint)
+
+    def better(self, objective, value, sense: Sense):
+        num = self._mk_numeral(objective, value)
+        return objective < num if sense is Sense.MIN else objective > num
+
+    def top(self):
+        return z3.BoolVal(True)
+
+    def le(self, term, bound):
+        return term <= bound
+
+    def ge(self, term, bound):
+        return term >= bound
+
+    # ---------------- 内部工具 ----------------
+    def _num(self, ref):
+        """z3 数值 ref -> python ``int`` / ``Fraction``；无穷/epsilon 抛 ``Unbounded``。"""
+        if z3.is_int_value(ref):
+            return ref.as_long()
+        if z3.is_rational_value(ref):
+            return Fraction(ref.numerator_as_long(), ref.denominator_as_long())
+        text = str(ref)
+        if "oo" in text or "epsilon" in text:
+            raise Unbounded(text)
+        try:
+            return Fraction(text)
+        except (ValueError, ZeroDivisionError) as exc:  # pragma: no cover
+            raise Unbounded(text) from exc
+
+    def _mk_numeral(self, term, value):
+        """按 ``term`` 的 sort 构造与 ``value`` 对应的 z3 数值常量。"""
+        if isinstance(value, Fraction) and value.denominator == 1:
+            value = value.numerator
+        if isinstance(value, int):
+            return z3.IntVal(value) if z3.is_int(term) else z3.RealVal(value)
+        # Fraction（实数）
+        return z3.RealVal(f"{value.numerator}/{value.denominator}")
+
+
+__all__ = ["Z3Backend", "Unbounded"]
