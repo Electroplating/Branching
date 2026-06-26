@@ -51,6 +51,7 @@ class TrainConfig:
     lambda_aux: float = 0.3
     grad_clip: float = 5.0
     device: str = "cpu"
+    accum_steps: int = 1  # 梯度累积步数，>1 时每 accum_steps 次 forward 才 backward 一次
 
 
 class ImitationTrainer:
@@ -64,17 +65,19 @@ class ImitationTrainer:
         )
 
     # ------------------------------------------------------------------ #
-    def train_step(self, example: RankingExample) -> dict[str, float]:
+    def train_step(self, example: RankingExample, backward: bool = True) -> dict[str, float] | tuple[dict[str, float], torch.Tensor]:
         self.policy.train()
         g = example.graph.to(self.config.device)
         out = self.policy(g)
         loss, parts = self._compute_loss(out, example)
 
-        self.opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.grad_clip)
-        self.opt.step()
-        return parts
+        if backward:
+            self.opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.grad_clip)
+            self.opt.step()
+            return parts
+        return parts, loss
 
     def fit(self, examples: Iterable[RankingExample], epochs: int = 1,
             log_every: int = 0) -> list[dict[str, float]]:
@@ -82,10 +85,16 @@ class ImitationTrainer:
         history: list[dict[str, float]] = []
         for ep in range(epochs):
             agg: dict[str, float] = {}
+            self.opt.zero_grad()
             for i, ex in enumerate(examples):
-                parts = self.train_step(ex)
+                parts, loss_tensor = self.train_step(ex, backward=False)
+                (loss_tensor / self.config.accum_steps).backward()
                 for k, v in parts.items():
                     agg[k] = agg.get(k, 0.0) + v
+                if (i + 1) % self.config.accum_steps == 0 or (i + 1) == len(examples):
+                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.grad_clip)
+                    self.opt.step()
+                    self.opt.zero_grad()
                 if log_every and (i + 1) % log_every == 0:
                     print(f"[epoch {ep} step {i + 1}] loss={parts['loss']:.4f}")
             n = max(1, len(examples))

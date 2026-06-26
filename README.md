@@ -62,3 +62,31 @@ python -m examples.demo
 2. 求解器读取返回的 `BranchingAdvice.activity_priors`，把先验混合进 SAT activity；
    普通 decision 仍由原生 priority queue 决定。
 3. 若 `advice.fallback is True`（超时 / 低置信 / OOD），求解器使用原生 heuristic。
+
+## 实验与评测
+
+项目已包含完整的合成数据实验流程，详见 [`experiments/EXPERIMENTS.md`](experiments/EXPERIMENTS.md)。
+
+快速复现：
+
+```bash
+conda activate omt
+python -m examples.demo
+python -m experiments.run_experiments
+python -m experiments.analyze_results
+python -m experiments.plot_results
+```
+
+主要结论：
+
+- GNN 在合成 OMT 快照上的 top-1 准确率（0.43–0.73）显著高于 VSIDS baseline（0.067）。
+- 增加 GNN 深度（4 层）比增加宽度更有效，最佳 top-1 达到 0.733。
+- 跨分布泛化（训练小图、测试大图）仍有挑战，需要 size-agnostic 设计或真实 solver 数据。
+- 单次推理开销约 12 ms（500 变量规模），部署时可接受，但真实 solver 需要子图采样与 refocus 策略。
+
+## 后续优化方向
+
+- 模型：引入 attention / Graph Transformer、edge gating、global readout。
+- 训练：hard negative mining、损失权重搜索、DAgger/REINFORCE 在线微调。
+- 部署：周期性 refocus、root embedding 缓存 + 轻量 MLP、k-hop 子图采样、OOD 回退。
+- 集成：在 Z3/νZ/OptiMathSAT 中插桩采集真实轨迹，验证 wall-clock time 与 PAR-2 改进。
