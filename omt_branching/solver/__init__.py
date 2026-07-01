@@ -24,6 +24,9 @@ from omt_branching.solver.strategy import (
     BaselineStrategy, NeuralStrategy, StrategyConfig,
 )
 from omt_branching.solver.bridge import BridgeConfig, NeuralGOMTSolver, solve_native
+from omt_branching.solver.rl import (
+    RLConfig, RLEpisode, RLRecordingStrategy, RLStep, SolverInLoopRLTrainer,
+)
 
 __all__ = [
     # 接口与数据类型
@@ -52,4 +55,10 @@ __all__ = [
     "NeuralGOMTSolver",
     "BridgeConfig",
     "solve_native",
+    # Solver-in-the-Loop 强化学习
+    "SolverInLoopRLTrainer",
+    "RLConfig",
+    "RLEpisode",
+    "RLStep",
+    "RLRecordingStrategy",
 ]
