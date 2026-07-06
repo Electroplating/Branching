@@ -104,6 +104,54 @@ def generate_dataset(count: int, seed: int = 0, *, id_prefix: str = "inst",
     return [generate_instance(f"{id_prefix}{i}", rng, **kwargs) for i in range(count)]
 
 
+def generate_hard_lia_instance(instance_id: str, rng: random.Random, *,
+                               n_vars: int = 10, n_constraints: int = 8, ub: int = 30,
+                               coeff_lo: int = 1, coeff_hi: int = 9, slack: int = 2,
+                               sense: Optional[Sense] = None) -> OMTInstance:
+    """witness 驱动的 hard LIA：紧 packing/covering 约束制造整数-LP 间隙，使 B&B 搜索非平凡。"""
+    xs = [z3.Int(f"{instance_id}_x{j}") for j in range(n_vars)]
+    names = [f"{instance_id}_x{j}" for j in range(n_vars)]
+    witness = [rng.randint(0, ub) for _ in range(n_vars)]
+
+    hard: list = []
+    for x in xs:
+        hard.append(x >= 0)
+        hard.append(x <= ub)
+
+    for _ in range(n_constraints):
+        coeffs = [rng.randint(coeff_lo, coeff_hi) for _ in range(n_vars)]
+        if all(c == 0 for c in coeffs):
+            coeffs[rng.randrange(n_vars)] = 1
+        lhs = z3.Sum([c * x for c, x in zip(coeffs, xs)])
+        lhs_val = sum(c * w for c, w in zip(coeffs, witness))
+        if rng.random() < 0.5:                      # packing：紧上界（witness 满足）
+            hard.append(lhs <= lhs_val + rng.randint(0, slack))
+        else:                                       # covering：紧下界（witness 满足）
+            hard.append(lhs >= max(0, lhs_val - rng.randint(0, slack)))
+
+    obj_c = [rng.randint(coeff_lo, coeff_hi) for _ in range(n_vars)]
+    objective = z3.Sum([c * x for c, x in zip(obj_c, xs)])
+    if sense is None:
+        sense = rng.choice([Sense.MIN, Sense.MAX])
+
+    return OMTInstance(
+        instance_id=instance_id, variables=xs, hard=hard, objective=objective, sense=sense,
+        obj_coeffs={n: float(c) for n, c in zip(names, obj_c)},
+        theory="LIA", family="hard", description=f"hard LIA, {n_vars} vars {n_constraints} cons",
+    )
+
+
+def generate_hard_lia_dataset(count: int, seed: int = 0, *, id_prefix: str = "hlia",
+                              min_vars: int = 8, max_vars: int = 14, **kwargs) -> list[OMTInstance]:
+    """生成 ``count`` 个 hard LIA 实例（变量数在 [min_vars, max_vars] 间随机）。"""
+    rng = random.Random(seed)
+    out: list[OMTInstance] = []
+    for i in range(count):
+        n_vars = rng.randint(min_vars, max_vars)
+        out.append(generate_hard_lia_instance(f"{id_prefix}{i}", rng, n_vars=n_vars, **kwargs))
+    return out
+
+
 # =========================================================================== #
 # LRA 生成（带布尔结构的实数线性优化，参照 LRA_script.py）
 # =========================================================================== #
@@ -406,6 +454,8 @@ __all__ = [
     "OMTInstance",
     "generate_instance",
     "generate_dataset",
+    "generate_hard_lia_instance",
+    "generate_hard_lia_dataset",
     "generate_lra_instance",
     "generate_lra_dataset",
     "LRA_FAMILIES",
