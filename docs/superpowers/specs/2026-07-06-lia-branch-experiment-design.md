@@ -45,19 +45,20 @@ z3 内部 MIP 节点；指标是 GOMT `solve_calls`/`splits`，比经典 MIP 节
 
 新增 `strong_branch_numeric_scores(extraction, phi, objective, sense, backend, config)`：对每个
 **整数数值变量**（`handle.is_integer` 且域跨度≥1），取中点 `m`，一层前瞻
-`v_lo = optimize(φ∧x≤m)`、`v_hi = optimize(φ∧x≥m+1)`，配合父最优 `v* = optimize(φ)`，
-用 **MIP 标准 product score**：
+`v_lo = optimize(φ∧x≤m)`、`v_hi = optimize(φ∧x≥m+1)`，用 **objective-separation score**：
 
 ```
-deg_lo = (v* − v_lo)   # MAX；MIN 对称取 (v_lo − v*)；某侧 UNSAT → deg 记大哨兵(剪半为好)
-score(x) = max(deg_lo, eps) * max(deg_hi, eps)
+score(x) = |v_lo − v_hi|         # 两侧都可行
+score(x) = SENT (大哨兵)          # 恰有一侧 UNSAT → 该分支直接剪掉半个域，有效
 ```
 
-即奖励"两侧目标都被显著收紧"的变量（一侧出 incumbent、另一侧被廉价剪）。与 LRA 布尔专家
-`|v_a−v_na|` 的差异：整数域切分**一侧 UNSAT 是有效剪枝**（非 LRA 的"被蕴含无进展"），故用
-product-with-sentinel 而非绝对差。`oracle_numeric_choice_sb(instance)` = argmax score。
+即奖励"最能把可达目标分到两侧"的变量（一侧出 incumbent、另一侧被 Better 割廉价剪）。与 LRA
+布尔专家同一 `|·|` 家族。**不用 MIP product score**：本设置在**整数域中点**切分、且 z3 不暴露
+LP 松弛，product score 对"最优落在某子一侧"的变量退化为 ≈0（反而避开真正有用的分支），
+objective-separation 更贴合且可测。整数域切分**一侧 UNSAT = 有效剪枝**（非 LRA 的"被蕴含无进展"），
+故记大哨兵而非 0。`oracle_numeric_choice_sb(instance)` = argmax score。
 
-方向标签：先探保留更优目标的一侧（`branch_up`）。
+方向标签 `branch_up`：先探保留更优目标的一侧（MAX→`v_hi≥v_lo` 则先探高侧）。
 
 ### C3 —— 启发式基线策略（`strategy.py`）
 
@@ -99,8 +100,8 @@ head 的 `int_target_scores` 用 C2 的 product score（经 `numeric_handles`→
 
 ## 5. 测试与风险
 
-- 测试（`tests/solver/`）：C1 生成器可行性 + 节点数分化；C2 product score 方向正确（两侧收紧
-  的变量 outrank 无收紧的）+ 一侧 UNSAT 记高；C3 各 mode 确定性且 soundness（== native）；
+- 测试（`tests/solver/`）：C1 生成器可行性 + 节点数分化；C2 objective-separation：影响目标的
+  变量 outrank 不影响目标的变量、一侧 UNSAT 记大哨兵；C3 各 mode 确定性且 soundness（== native）；
   C4 `numeric_expert="strong"` 产出非空数值标签；`lia_branch` 小规模冒烟。
 - **风险①**：实例太易 → 节点数不分化。缓解：硬度旋钮 + 生成期经验校验（strong 与 random 的
   solve_calls 需拉开差距）。
