@@ -105,10 +105,16 @@ def generate_dataset(count: int, seed: int = 0, *, id_prefix: str = "inst",
 
 
 def generate_hard_lia_instance(instance_id: str, rng: random.Random, *,
-                               n_vars: int = 10, n_constraints: int = 8, ub: int = 30,
-                               coeff_lo: int = 1, coeff_hi: int = 9, slack: int = 2,
+                               n_vars: int = 6, n_constraints: int = 4, ub: int = 8,
+                               coeff_lo: int = 1, coeff_hi: int = 5, slack: int = 1,
                                sense: Optional[Sense] = None) -> OMTInstance:
-    """witness 驱动的 hard LIA：紧 packing/covering 约束制造整数-LP 间隙，使 B&B 搜索非平凡。"""
+    """witness 驱动的 knapsack 型 LIA：紧 **packing** 约束（``Σa x ≤ b``）+ MAX 目标，
+    整数-LP 间隙使 plain 模式 B&B 搜索非平凡，但 z3 ``Optimize`` 仍可秒级求解（可作 native
+    参照与 strong-branching 教师）。
+
+    只用 packing（不用 covering）：covering 会令 z3 ``Optimize`` 自身爆炸式变慢，无法生成
+    strong-branching 标签；MAX + packing 是"分支有意义且 z3 可解"的可行区。
+    """
     xs = [z3.Int(f"{instance_id}_x{j}") for j in range(n_vars)]
     names = [f"{instance_id}_x{j}" for j in range(n_vars)]
     witness = [rng.randint(0, ub) for _ in range(n_vars)]
@@ -124,26 +130,24 @@ def generate_hard_lia_instance(instance_id: str, rng: random.Random, *,
             coeffs[rng.randrange(n_vars)] = 1
         lhs = z3.Sum([c * x for c, x in zip(coeffs, xs)])
         lhs_val = sum(c * w for c, w in zip(coeffs, witness))
-        if rng.random() < 0.5:                      # packing：紧上界（witness 满足）
-            hard.append(lhs <= lhs_val + rng.randint(0, slack))
-        else:                                       # covering：紧下界（witness 满足）
-            hard.append(lhs >= max(0, lhs_val - rng.randint(0, slack)))
+        hard.append(lhs <= lhs_val + rng.randint(0, slack))     # packing：紧上界（witness 满足）
 
     obj_c = [rng.randint(coeff_lo, coeff_hi) for _ in range(n_vars)]
     objective = z3.Sum([c * x for c, x in zip(obj_c, xs)])
+    # packing-only 下 MIN 平凡（最优≈0），故默认 MAX（knapsack）。
     if sense is None:
-        sense = rng.choice([Sense.MIN, Sense.MAX])
+        sense = Sense.MAX
 
     return OMTInstance(
         instance_id=instance_id, variables=xs, hard=hard, objective=objective, sense=sense,
         obj_coeffs={n: float(c) for n, c in zip(names, obj_c)},
-        theory="LIA", family="hard", description=f"hard LIA, {n_vars} vars {n_constraints} cons",
+        theory="LIA", family="knapsack", description=f"knapsack LIA, {n_vars} vars {n_constraints} cons",
     )
 
 
 def generate_hard_lia_dataset(count: int, seed: int = 0, *, id_prefix: str = "hlia",
-                              min_vars: int = 8, max_vars: int = 14, **kwargs) -> list[OMTInstance]:
-    """生成 ``count`` 个 hard LIA 实例（变量数在 [min_vars, max_vars] 间随机）。"""
+                              min_vars: int = 5, max_vars: int = 7, **kwargs) -> list[OMTInstance]:
+    """生成 ``count`` 个 knapsack LIA 实例（变量数在 [min_vars, max_vars] 间随机）。"""
     rng = random.Random(seed)
     out: list[OMTInstance] = []
     for i in range(count):
