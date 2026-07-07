@@ -25,3 +25,17 @@ def test_failed_literal_gets_sentinel():
     sc, ph = lookahead_scores(hard, atoms=[a], config=LookaheadConfig(sentinel=1e6))
     assert sc[atom_key(a)] >= 1e6      # failed literal
     assert ph[atom_key(a)] is False    # 可行侧是 a=False
+
+
+def test_build_lookahead_examples_has_bool_labels():
+    from omt_branching.solver import generate_bool_lia_dataset
+    from omt_branching.solver.training_data import build_lookahead_examples
+    from omt_branching.interfaces import NodeType
+
+    ds = generate_bool_lia_dataset(6, seed=3, min_vars=5, max_vars=6)
+    exs = build_lookahead_examples(ds)
+    assert exs and any(e.bool_target_scores for e in exs)
+    e = next(e for e in exs if e.bool_target_scores)
+    n_bool = e.graph.num_nodes(NodeType.BOOL_VAR)
+    assert all(0 <= k < n_bool for k in e.bool_target_scores)
+    assert e.phase_targets   # phase 标签也在
