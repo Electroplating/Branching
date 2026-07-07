@@ -1,0 +1,30 @@
+from __future__ import annotations
+import pytest
+z3 = pytest.importorskip("z3")
+torch = pytest.importorskip("torch")
+
+from omt_branching.model.policy import BranchingPolicy
+from omt_branching.service import BranchingPolicyService
+from omt_branching.solver import generate_hard_lia_dataset, solve_native
+from omt_branching.solver.decide_omt import solve_omt_with_decider
+from omt_branching.solver.policy_decider import PolicyDecider
+
+
+def test_vsids_arm_matches_native():
+    inst = generate_hard_lia_dataset(1, seed=5, min_vars=4, max_vars=4)[0]
+    hard, obj, sense = inst.as_tuple()
+    r = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
+    assert r["value"] == solve_native(hard, obj, sense)
+    assert r["decisions"] is None       # VSIDS 臂不挂 propagator
+
+
+def test_learned_arm_matches_native_and_fires():
+    inst = generate_hard_lia_dataset(1, seed=5, min_vars=4, max_vars=4)[0]
+    hard, obj, sense = inst.as_tuple()
+    svc = BranchingPolicyService(policy=BranchingPolicy())
+    r = solve_omt_with_decider(
+        hard, obj, sense,
+        decider_factory=lambda a: PolicyDecider(svc, a, refocus_every=50))
+    assert r["value"] == solve_native(hard, obj, sense)   # 正确性：== native
+    assert r["decisions"] is not None                     # propagator 在回路里生效
+    assert r["rlimit"] > 0
