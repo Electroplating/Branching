@@ -29,12 +29,25 @@ def main() -> None:
     ap.add_argument("--min-vars", type=int, default=4)
     ap.add_argument("--max-vars", type=int, default=5)
     ap.add_argument("--refocus", type=int, default=50)
+    ap.add_argument("--train", type=int, default=0, help="look-ahead imitation 训练集规模(0=不训练)")
+    ap.add_argument("--epochs", type=int, default=20)
     args = ap.parse_args()
 
     torch.manual_seed(0)
     insts = generate_bool_lia_dataset(args.test, seed=99,
                                       min_vars=args.min_vars, max_vars=args.max_vars)
-    svc = BranchingPolicyService(policy=BranchingPolicy())
+
+    policy = BranchingPolicy()
+    if args.train > 0:
+        from omt_branching.model.trainer import ImitationTrainer, TrainConfig
+        from omt_branching.solver.training_data import build_lookahead_examples
+        train = generate_bool_lia_dataset(args.train, seed=1,
+                                          min_vars=args.min_vars, max_vars=args.max_vars)
+        exs = [e for e in build_lookahead_examples(train) if e.bool_target_scores]
+        hist = ImitationTrainer(policy, TrainConfig(lr=5e-3)).fit(exs, epochs=args.epochs)
+        print(f"look-ahead imitation: {len(exs)} 样本, branch loss "
+              f"{hist[0].get('branch', 0):.3f} -> {hist[-1].get('branch', 0):.3f}")
+    svc = BranchingPolicyService(policy=policy)
 
     agg = {"native": {"rlimit": 0.0},
            "vsids": {"rlimit": 0.0, "conflicts": 0.0, "match": 0.0},

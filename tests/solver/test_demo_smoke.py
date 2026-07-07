@@ -31,7 +31,7 @@ def test_rl_lra_smoke_reports_bool_accuracy():
 def test_decide_branch_smoke():
     out = subprocess.run(
         [sys.executable, "-m", "examples.decide_branch",
-         "--test", "5", "--min-vars", "4", "--max-vars", "4"],
+         "--test", "5", "--train", "6", "--epochs", "3", "--min-vars", "5", "--max-vars", "5"],
         capture_output=True, text=True, timeout=600,
     )
     assert out.returncode == 0, out.stderr
