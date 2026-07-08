@@ -57,3 +57,13 @@ def test_sat_branch_smoke():
     )
     assert out.returncode == 0, out.stderr
     assert "VSIDS" in out.stdout
+
+
+def test_smt_branch_smoke():
+    out = subprocess.run(
+        [sys.executable, "-m", "examples.smt_branch",
+         "--n-vars", "6", "--n-disj", "15", "--test", "3", "--train", "4", "--epochs", "3"],
+        capture_output=True, text=True, timeout=600,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "SMT-LIA" in out.stdout
