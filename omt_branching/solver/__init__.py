@@ -43,6 +43,13 @@ from omt_branching.solver.propagator_snapshot import (
 from omt_branching.solver.propagator import LearnedDecidePropagator
 from omt_branching.solver.policy_decider import PolicyDecider
 from omt_branching.solver.decide_omt import solve_omt_with_decider
+from omt_branching.solver.lookahead import (
+    LookaheadConfig, build_lookahead_example, build_lookahead_examples,
+    decide_bool_hit, lookahead_scores,
+)
+from omt_branching.solver.decide_rl import (
+    DecideEpisode, DecideRLConfig, DecideRLTrainer, DecideStep, SamplingDecider,
+)
 from omt_branching.solver.strong_branch import (
     StrongBranchConfig, oracle_bool_choice, oracle_numeric_choice_sb,
     strong_branch_numeric_scores, strong_branch_scores,
@@ -114,4 +121,15 @@ __all__ = [
     "LearnedDecidePropagator",
     "PolicyDecider",
     "solve_omt_with_decider",
+    # UserPropagator 学习分支（Phase 2：look-ahead imitation + decide 路径 RL）
+    "LookaheadConfig",
+    "lookahead_scores",
+    "build_lookahead_example",
+    "build_lookahead_examples",
+    "decide_bool_hit",
+    "DecideRLConfig",
+    "DecideStep",
+    "DecideEpisode",
+    "SamplingDecider",
+    "DecideRLTrainer",
 ]

@@ -38,6 +38,17 @@ def test_decide_branch_smoke():
     assert "三臂对比" in out.stdout
 
 
+def test_decide_learn_smoke():
+    out = subprocess.run(
+        [sys.executable, "-m", "examples.decide_learn",
+         "--train", "6", "--test", "4", "--min-vars", "4", "--max-vars", "4",
+         "--iters", "1", "--epochs", "3", "--refocus", "20"],
+        capture_output=True, text=True, timeout=900,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "Phase 2 结论" in out.stdout
+
+
 def test_lia_branch_smoke_reaches_native():
     out = subprocess.run(
         [sys.executable, "-m", "examples.lia_branch",
