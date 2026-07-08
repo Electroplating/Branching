@@ -39,3 +39,17 @@ def test_decide_rl_collect_update_runs():
     stats = tr.update(steps, reward, key=0)
     assert math.isfinite(stats["loss"])
     assert 0 in tr._baselines             # baseline 记录
+
+
+def test_decide_rl_sat_collect_update():
+    import math
+    from omt_branching.solver.sat_instances import generate_rand_3sat
+    from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
+
+    atoms, clauses = generate_rand_3sat(30, 4.26, seed=1)
+    tr = DecideRLTrainer(BranchingPolicy(), DecideRLConfig(refocus_every=40))
+    steps, reward, res = tr.collect_sat(clauses, atoms)
+    assert res["result"] in ("sat", "unsat")
+    assert math.isfinite(reward)
+    stats = tr.update(steps, reward, key=0)
+    assert math.isfinite(stats["loss"])

@@ -108,6 +108,37 @@ class DecideRLTrainer:
         reward = -math.log1p(res["rlimit"])
         return steps, reward, res
 
+    def collect_sat(self, assertions, atoms):
+        from omt_branching.solver.sat_solve import solve_sat_with_decider
+
+        holder: dict = {}
+
+        def factory(asserts):
+            d = SamplingPolicyDecider(self.policy, self.defer_logit, asserts,
+                                      self.config.refocus_every, sample=True)
+            holder["d"] = d
+            return d
+
+        res = solve_sat_with_decider(list(assertions), list(atoms),
+                                     decider_factory=lambda a: factory(a))
+        steps = holder["d"].steps if "d" in holder else []
+        reward = -math.log1p(res["conflicts"])
+        return steps, reward, res
+
+    def train_sat(self, problems, iterations: int = 1, log: bool = False):
+        problems = list(problems)
+        history = []
+        for it in range(iterations):
+            for j, (assertions, atoms) in enumerate(problems):
+                steps, reward, res = self.collect_sat(assertions, atoms)
+                stats = self.update(steps, reward, key=j)
+                stats.update({"iter": it, "instance": j, "conflicts": res["conflicts"]})
+                history.append(stats)
+                if log:
+                    print(f"[it {it} inst {j}] loss={stats['loss']:.4f} reward={reward:.3f} "
+                          f"conflicts={res['conflicts']} steps={stats['steps']}")
+        return history
+
     def update(self, steps, reward, key) -> dict:
         if not steps:
             self._update_baseline_for(key, reward)
