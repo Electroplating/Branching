@@ -64,3 +64,20 @@ def test_build_bool_snapshot_theory_features():
     sat_atoms, sat_clauses = generate_rand_3sat(20, seed=7)
     ssnap, _ = build_bool_snapshot(sat_clauses)
     assert ssnap.theory_atoms == [] and ssnap.numeric_vars == []
+
+
+def test_linear_decomposition_branches():
+    """直接单测 _linear 的 SUB/UMINUS/有理常数分支，覆盖 ADD-of-MUL 之外的形状。"""
+    import z3
+    from omt_branching.solver.propagator_snapshot import _linear
+    x, y = z3.Ints("x y")
+    # SUB: 3*x - 2*y  -> {x:3, y:-2}, const 0
+    c, k = _linear(3 * x - 2 * y)
+    assert c[str(x)] == 3.0 and c[str(y)] == -2.0 and k == 0.0
+    # UMINUS: -x -> {x:-1}
+    c, k = _linear(-x)
+    assert c[str(x)] == -1.0
+    # 有理常数 (Real): x/2 形式的系数与常数项
+    r = z3.Real("r")
+    c, k = _linear(r + z3.RealVal("3/2"))
+    assert c[str(r)] == 1.0 and abs(k - 1.5) < 1e-9

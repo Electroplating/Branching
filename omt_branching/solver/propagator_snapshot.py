@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import warnings
 from typing import Optional
 
 import z3
@@ -146,7 +147,9 @@ def _linear(e) -> tuple[dict, float]:
         if len(rest) == 1:
             cc, ck = _linear(rest[0])
             return {v: a * scale for v, a in cc.items()}, ck * scale
+        warnings.warn(f"_linear 遇到无法分解的表达式，退化为空系数: {e}")
         return {}, 0.0  # 两个非常量因子相乘：非线性，本任务原子不会触发
+    warnings.warn(f"_linear 遇到无法分解的表达式，退化为空系数: {e}")
     return {}, 0.0  # 未识别的算术形状：退化为 0，不阻断建图
 
 
