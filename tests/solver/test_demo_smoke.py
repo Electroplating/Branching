@@ -31,22 +31,11 @@ def test_rl_lra_smoke_reports_bool_accuracy():
 def test_decide_branch_smoke():
     out = subprocess.run(
         [sys.executable, "-m", "examples.decide_branch",
-         "--test", "5", "--min-vars", "4", "--max-vars", "4"],
+         "--test", "5", "--train", "6", "--epochs", "3", "--min-vars", "5", "--max-vars", "5"],
         capture_output=True, text=True, timeout=600,
     )
     assert out.returncode == 0, out.stderr
     assert "三臂对比" in out.stdout
-
-
-def test_decide_learn_smoke():
-    out = subprocess.run(
-        [sys.executable, "-m", "examples.decide_learn",
-         "--train", "6", "--test", "4", "--min-vars", "4", "--max-vars", "4",
-         "--iters", "1", "--epochs", "3", "--refocus", "20"],
-        capture_output=True, text=True, timeout=900,
-    )
-    assert out.returncode == 0, out.stderr
-    assert "Phase 2 结论" in out.stdout
 
 
 def test_lia_branch_smoke_reaches_native():
@@ -58,3 +47,23 @@ def test_lia_branch_smoke_reaches_native():
     )
     assert out.returncode == 0, out.stderr
     assert "搜索规模" in out.stdout
+
+
+def test_sat_branch_smoke():
+    out = subprocess.run(
+        [sys.executable, "-m", "examples.sat_branch",
+         "--php", "5", "--sat-n", "40", "--test", "3", "--train", "4", "--epochs", "3"],
+        capture_output=True, text=True, timeout=600,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "VSIDS" in out.stdout
+
+
+def test_smt_branch_smoke():
+    out = subprocess.run(
+        [sys.executable, "-m", "examples.smt_branch",
+         "--n-vars", "6", "--n-disj", "15", "--test", "3", "--train", "4", "--epochs", "3"],
+        capture_output=True, text=True, timeout=600,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "SMT-LIA" in out.stdout

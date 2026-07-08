@@ -105,10 +105,11 @@ def generate_dataset(count: int, seed: int = 0, *, id_prefix: str = "inst",
 
 
 def generate_bool_lia_instance(instance_id: str, rng: random.Random, *,
-                               n_vars: int = 5, n_disj: int = 5, k: int = 3, ub: int = 8,
-                               chi: int = 4, sense: Sense = Sense.MAX) -> OMTInstance:
-    """带**布尔结构**的有界整数 OMT：若干 ``k`` 元析取(``Or`` of 线性不等式)制造真正的布尔
-    分支点(z3 须 case-split),供 UserPropagator 学习分支研究。witness 驱动保证 SAT + 有界。"""
+                               n_vars: int = 5, n_disj: int = 8, k: int = 3, ub: int = 8,
+                               chi: int = 4, pool_mult: int = 2, sense: Sense = Sense.MAX) -> OMTInstance:
+    """带**布尔结构**的有界整数 OMT：从一个**共享原子池**采样构造 ``k`` 元析取(``Or``)——
+    原子在多个子句间**复用**(度>1),使子句共现图有信息、布尔传播可学(供 UserPropagator 学习
+    分支研究)。witness 驱动保证 SAT + 有界。"""
     xs = [z3.Int(f"{instance_id}_x{j}") for j in range(n_vars)]
     names = [f"{instance_id}_x{j}" for j in range(n_vars)]
     witness = [rng.randint(0, ub) for _ in range(n_vars)]
@@ -118,25 +119,31 @@ def generate_bool_lia_instance(instance_id: str, rng: random.Random, *,
         hard.append(x >= 0)
         hard.append(x <= ub)
 
-    def _ineq(sat_at_witness: bool):
+    # 共享原子池：每个原子记录在 witness 上是否成立（用于保证每个子句 SAT）。
+    n_pool = max(k + 2, n_vars * pool_mult)
+    pool: list = []
+    for _ in range(n_pool):
         coeffs = [rng.randint(1, chi) for _ in range(n_vars)]
         lhs = z3.Sum([c * x for c, x in zip(coeffs, xs)])
         v = sum(c * w for c, w in zip(coeffs, witness))
-        if sat_at_witness:                     # witness 满足：<= v + slack
-            return lhs <= v + rng.randint(0, 2)
-        return lhs >= v + rng.randint(1, 4)    # witness 不满足：> v
+        b = v + rng.randint(-3, 4)             # 有时 witness 满足、有时不满足
+        pool.append((lhs <= b, sum(c * w for c, w in zip(coeffs, witness)) <= b))
+    if not any(h for _, h in pool):            # 保证池里至少有一个 witness-true 原子
+        pool[0] = (xs[0] <= ub, True)
 
+    true_pool = [ah for ah in pool if ah[1]]
     for _ in range(n_disj):
-        sat_idx = rng.randrange(k)             # 令第 sat_idx 个 disjunct 在 witness 上为真
-        lits = [_ineq(i == sat_idx) for i in range(k)]
-        hard.append(z3.Or(*lits))
+        chosen = rng.sample(pool, min(k, len(pool)))
+        if not any(h for _, h in chosen):      # 每个子句至少含一个 witness-true 原子 -> SAT
+            chosen[0] = rng.choice(true_pool)
+        hard.append(z3.Or(*[a for a, _ in chosen]))
 
     obj_c = [rng.randint(1, chi) for _ in range(n_vars)]
     objective = z3.Sum([c * x for c, x in zip(obj_c, xs)])
     return OMTInstance(
         instance_id=instance_id, variables=xs, hard=hard, objective=objective, sense=sense,
         obj_coeffs={n: float(c) for n, c in zip(names, obj_c)},
-        theory="LIA", family="bool", description=f"bool LIA, {n_vars} vars {n_disj} disj",
+        theory="LIA", family="bool", description=f"bool LIA, {n_vars} vars {n_disj} disj (shared pool)",
     )
 
 
@@ -148,6 +155,20 @@ def generate_bool_lia_dataset(count: int, seed: int = 0, *, id_prefix: str = "bl
     for i in range(count):
         n_vars = rng.randint(min_vars, max_vars)
         out.append(generate_bool_lia_instance(f"{id_prefix}{i}", rng, n_vars=n_vars, **kwargs))
+    return out
+
+
+def generate_hard_bool_lia_dataset(count: int, seed: int = 0, *, id_prefix: str = "hblia",
+                                   min_vars: int = 6, max_vars: int = 8, **kwargs) -> list[OMTInstance]:
+    """更难的布尔结构整数 OMT：更多析取(n_disj=24)、更大子句(k=4)、更紧原子池(pool_mult=1)，
+    使 z3 VSIDS 探索更多冲突 -> 给学习分支留 headroom。"""
+    hard_defaults = dict(n_disj=24, k=4, ub=10, chi=5, pool_mult=1)
+    hard_defaults.update(kwargs)
+    rng = random.Random(seed)
+    out: list[OMTInstance] = []
+    for i in range(count):
+        n_vars = rng.randint(min_vars, max_vars)
+        out.append(generate_bool_lia_instance(f"{id_prefix}{i}", rng, n_vars=n_vars, **hard_defaults))
     return out
 
 
@@ -509,6 +530,7 @@ __all__ = [
     "generate_hard_lia_dataset",
     "generate_bool_lia_instance",
     "generate_bool_lia_dataset",
+    "generate_hard_bool_lia_dataset",
     "generate_lra_instance",
     "generate_lra_dataset",
     "LRA_FAMILIES",
