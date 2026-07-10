@@ -63,7 +63,10 @@ def solve_omt_with_decider(
         "value": _num(best_val),
         "rlimit": _stat(s, "rlimit count"),
         "weighted rlimit": sum(
-            [math.log2(float(best_val) / local + 1) * cost for local, cost in records]
+            [
+                math.log2(float(best_val.as_long()) / local.as_long() + 1) * cost
+                for local, cost in records
+            ]
         ),
         "conflicts": _stat(s, "conflicts"),
         "decisions": (prop.n_decisions if prop is not None else None),
