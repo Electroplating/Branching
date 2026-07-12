@@ -46,7 +46,7 @@ def solve_omt_with_decider(
         atoms = collect_atoms(list(hard))
         decider = decider_factory(list(hard))
         prop = LearnedDecidePropagator(s, atoms, decider)
-    rlimit = 0
+    rlimit = _stat(s, "rlimit count")
 
     s.add(*hard)
     model_rlimit = [_stat(s, "rlimit count") - rlimit]
