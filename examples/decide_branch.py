@@ -109,12 +109,13 @@ def main() -> None:
     with tqdm(total=len(insts), desc="test") as pbar:
         for inst in insts:
             hard, obj, sense = inst.as_tuple()
-            if h:
-                rewards = [col["reward"] for col in h]
-                rlimit_max = math.exp(-min(rewards))-1
-                rlimit_bound = int(rlimit_max * 100)
-            else:
-                rlimit_bound = -1
+            # if h:
+            #     rewards = [col["reward"] for col in h]
+            #     rlimit_max = math.exp(-min(rewards))-1
+            #     rlimit_bound = int(rlimit_max * 100)
+            # else:
+            #     rlimit_bound = -1
+            rlimit_bound = -1
             nat = solve_native(hard, obj, sense, max_rlimit=rlimit_bound)
             if nat["value"] is None:
                 skipped += 1

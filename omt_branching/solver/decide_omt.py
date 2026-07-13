@@ -133,30 +133,24 @@ def solve_native(
     o = z3.Optimize(ctx=ctx)
     if max_rlimit > 0:
         o.set("rlimit", max_rlimit)
-
-    def _translate(expr, dst_ctx):
-        return z3.ExprRef(
-            z3.Z3_translate(expr.ctx.ref(), expr.as_ast(), dst_ctx.ref()),
-            dst_ctx,
-        )
-
-    hard_iso = [_translate(h, ctx) for h in hard]
-    obj_iso = _translate(obj, ctx)
+    hard_iso = [h.translate(ctx) for h in hard]
+    obj_iso = obj.translate(ctx)
     o.add(*hard_iso)
     if sense is Sense.MIN:
         o.minimize(obj_iso)
     else:
         o.maximize(obj_iso)
     res = o.check()
+    rlimit = _stat(o, "rlimit count")
     if res != z3.sat:
         return {
             "value": None,
-            "rlimit": o.statistics().get_key_value("rlimit count"),
+            "rlimit": rlimit,
         }
     m = o.model()
     return {
         "value": _num(m.eval(obj_iso, model_completion=True)),
-        "rlimit": o.statistics().get_key_value("rlimit count"),
+        "rlimit": rlimit,
     }
 
 
