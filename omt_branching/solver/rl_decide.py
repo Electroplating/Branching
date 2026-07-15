@@ -24,9 +24,11 @@ from tqdm import tqdm
 
 class SamplingPolicyDecider:
     def __init__(self, policy: BranchingPolicy, defer_logit, assertions,
-                 refocus_every: int = 50, sample: bool = True):
+                 refocus_every: int = 50, sample: bool = True,
+                 device: str | torch.device = "cpu"):
         self.policy = policy
         self.defer_logit = defer_logit          # torch 标量（trainer 持有的可学参数）
+        self.device = device
         self.assertions = list(assertions)
         self.refocus_every = max(1, refocus_every)
         self.sample = sample
@@ -39,6 +41,7 @@ class SamplingPolicyDecider:
     def _refocus(self, assignment):
         snap, _ = build_bool_snapshot(self.assertions, assignment=assignment)
         g = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
+        g = g.to(self.device)
         out = self.policy.infer(g)
         self._graph = g
         self._scores = out.bool_branch_scores.detach()
@@ -81,7 +84,9 @@ class DecideRLTrainer:
         self.policy = policy.to(config.device)
         self.config = config
         self.defer_logit = torch.nn.Parameter(torch.zeros((), device=config.device))
-        self.opt = torch.optim.Adam(list(policy.parameters()) + [self.defer_logit], lr=config.lr)
+        self.opt = torch.optim.Adam(
+            list(self.policy.parameters()) + [self.defer_logit], lr=config.lr
+        )
         self._baselines: dict = {}
         self._baseline = 0.0
 
@@ -99,8 +104,14 @@ class DecideRLTrainer:
         holder: dict = {}
 
         def factory(assertions):
-            d = SamplingPolicyDecider(self.policy, self.defer_logit, assertions,
-                                      self.config.refocus_every, sample=True)
+            d = SamplingPolicyDecider(
+                self.policy,
+                self.defer_logit,
+                assertions,
+                self.config.refocus_every,
+                sample=True,
+                device=self.config.device,
+            )
             holder["d"] = d
             return d
 
@@ -116,8 +127,14 @@ class DecideRLTrainer:
         holder: dict = {}
 
         def factory(asserts):
-            d = SamplingPolicyDecider(self.policy, self.defer_logit, asserts,
-                                      self.config.refocus_every, sample=True)
+            d = SamplingPolicyDecider(
+                self.policy,
+                self.defer_logit,
+                asserts,
+                self.config.refocus_every,
+                sample=True,
+                device=self.config.device,
+            )
             holder["d"] = d
             return d
 
@@ -153,7 +170,8 @@ class DecideRLTrainer:
         for g, locs, idx in steps:
             gid = id(g)
             if gid not in cache:
-                cache[gid] = self.policy(g).bool_branch_scores
+                g_dev = g.to(self.config.device)
+                cache[gid] = self.policy(g_dev).bool_branch_scores
             scores = cache[gid]
             logits = torch.cat([self.defer_logit.reshape(1), scores[locs]])
             logp = torch.log_softmax(logits, dim=0)[idx]

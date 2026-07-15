@@ -41,6 +41,23 @@ def test_decide_rl_collect_update_runs():
     assert 0 in tr._baselines             # baseline 记录
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
+def test_decide_rl_cuda_graph_on_device():
+    """RL collect/update 时图特征须与策略同设备（否则 addmm 报 device mismatch）。"""
+    import math
+
+    from omt_branching.solver import generate_bool_lia_dataset
+    from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
+
+    inst = generate_bool_lia_dataset(1, seed=7, min_vars=5, max_vars=5)[0]
+    hard, obj, sense = inst.as_tuple()
+    tr = DecideRLTrainer(BranchingPolicy(), DecideRLConfig(refocus_every=20, device="cuda"))
+    steps, reward, _ = tr.collect(hard, obj, sense)
+    stats = tr.update(steps, reward, key=0)
+    assert next(tr.policy.parameters()).device.type == "cuda"
+    assert math.isfinite(stats["loss"])
+
+
 def test_decide_rl_sat_collect_update():
     import math
     from omt_branching.solver.sat_instances import generate_rand_3sat
