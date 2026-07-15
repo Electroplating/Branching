@@ -30,6 +30,24 @@ def test_learned_arm_matches_native_and_fires():
     assert r["rlimit"] > 0
 
 
+def test_parse_get_value_after_objective_expr():
+    from omt_branching.solver.decide_omt import _parse_get_value, _parse_z3_statistics
+
+    obj = "(+ (* 4 x0) (* 2 x1))"
+    stdout = (
+        "sat\n"
+        f"((({obj}) 66))\n"
+        "(:conflicts 14\n"
+        " :decisions 67\n"
+        " :rlimit-count 7888)\n"
+    )
+    assert _parse_get_value(stdout, obj) == 66
+    stats = _parse_z3_statistics(stdout)
+    assert stats["conflicts"] == 14
+    assert stats["decisions"] == 67
+    assert stats["rlimit-count"] == 7888
+
+
 def test_solve_binary_matches_native_on_bool_lia():
     import shutil
     from omt_branching.solver import generate_bool_lia_dataset, instance_to_smt2

@@ -208,32 +208,57 @@ def _parse_smt_num(token: str) -> Optional[Fraction]:
         return None
 
 
-def _parse_get_value_line(line: str) -> Optional[Fraction]:
-    """从单行 ``(get-value ...)`` 响应解析目标最优值。"""
-    line = line.strip()
-    if not line.startswith("(("):
+def _parse_smt_value_at(rest: str) -> Optional[Fraction]:
+    """从 S 表达式尾部解析数值（整数或有理数 ``(/ n d)``）。"""
+    rest = rest.lstrip()
+    if not rest:
         return None
-    m = re.search(
-        r"\)\s+(\(\/\s+-?\d+\s+-?\d+\)|-?\d+)\s*\)\s*\)\s*$",
-        line,
-    )
-    if m is None:
+    if rest.startswith("(/"):
+        depth = 0
+        for i, ch in enumerate(rest):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return _parse_smt_num(rest[: i + 1])
         return None
-    return _parse_smt_num(m.group(1))
+    m = re.match(r"(-?\d+)", rest)
+    return _parse_smt_num(m.group(1)) if m else None
 
 
-def _parse_get_value(stdout: str) -> Optional[Fraction]:
-    """从 z3 标准输出解析 ``(get-value ...)`` 的最优值。"""
-    # 统计块 ``(:rlimit-count ...`` 之前为求解输出
+def _parse_get_value(stdout: str, obj_sexpr: str) -> Optional[Fraction]:
+    """从 ``(get-value (obj))`` 响应解析最优值：取**目标表达式之后**的数值。"""
     head = stdout.split("(:", 1)[0]
-    for line in head.splitlines():
-        val = _parse_get_value_line(line.strip())
-        if val is not None:
-            return val
-    return None
+    idx = head.find(obj_sexpr)
+    if idx == -1:
+        return None
+    rest = head[idx + len(obj_sexpr) :].lstrip()
+    while rest.startswith(")"):
+        rest = rest[1:].lstrip()
+    return _parse_smt_value_at(rest)
+
+
+def _parse_z3_statistics(stdout: str) -> dict[str, int | float]:
+    """解析 z3 ``-st`` 统计块中的 ``:keyword value`` 对。"""
+    start = stdout.find("(:")
+    if start == -1:
+        return {}
+    section = stdout[start:]
+    out: dict[str, int | float] = {}
+    for m in re.finditer(r":([-\w]+)\s+([-\d.]+)", section):
+        key, raw = m.group(1), m.group(2)
+        try:
+            out[key] = int(raw) if "." not in raw else float(raw)
+        except ValueError:
+            continue
+    return out
 
 
 def _parse_rlimit(stdout: str) -> int:
+    stats = _parse_z3_statistics(stdout)
+    if "rlimit-count" in stats:
+        return int(stats["rlimit-count"])
     m = re.search(r":rlimit-count\s+(\d+)", stdout)
     return int(m.group(1)) if m else 0
 
@@ -281,18 +306,23 @@ def solve_binary(
         return {
             "value": None,
             "rlimit": None,
+            "conflicts": None,
+            "decisions": None,
             "time_ms": timeout_s * 1000.0,
             "status": "timeout",
             "stderr": "timeout",
+            "z3_stats": {},
         }
     finally:
         Path(path).unlink(missing_ok=True)
 
     stdout = proc.stdout or ""
     stderr = (proc.stderr or "").strip()
+    obj_sexpr = inst.objective.sexpr()
     status = _parse_sat(stdout)
-    rlimit = _parse_rlimit(stdout)
-    value = _parse_get_value(stdout) if status == "sat" else None
+    z3_stats = _parse_z3_statistics(stdout)
+    rlimit = int(z3_stats.get("rlimit-count", 0))
+    value = _parse_get_value(stdout, obj_sexpr) if status == "sat" else None
     if status == "sat" and value is None:
         err_lines = [
             ln.strip()
@@ -304,10 +334,13 @@ def solve_binary(
     return {
         "value": value,
         "rlimit": rlimit,
+        "conflicts": z3_stats.get("conflicts"),
+        "decisions": z3_stats.get("decisions"),
         "time_ms": elapsed_ms,
         "status": status,
         "stderr": stderr,
         "returncode": proc.returncode,
+        "z3_stats": z3_stats,
     }
 
 
