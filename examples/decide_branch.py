@@ -1,7 +1,7 @@
-"""四臂对比：native z3 Optimize / z3 二进制 / VSIDS-decide / learned-decide（未训练 GNN）。
+"""三臂对比：z3 二进制参考 / VSIDS-decide / learned-decide（未训练 GNN）。
 
-证明管道正确（learned 臂 == native）并测量 rlimit/conflicts/decisions；``solve_binary``
-作独立 z3 可执行文件参照。为 Phase 2（look-ahead imitation + RL）铺路。
+以 ``solve_binary``（z3 可执行文件）给出参考最优值，测量 VSIDS/learned 相对参考的
+正确性（match）与 rlimit/conflicts/decisions。为 Phase 2（look-ahead imitation + RL）铺路。
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from omt_branching.solver import (
     # Z3Backend,
     generate_bool_lia_dataset,
     solve_binary,
-    solve_native,
     solve_omt_with_decider,
 )
 from omt_branching.solver.instance_gen import OMTInstance
@@ -99,7 +98,7 @@ def _stats_for_json(stats: dict) -> dict:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="UserPropagator 学习分支三臂对比")
+    ap = argparse.ArgumentParser(description="UserPropagator 学习分支三臂对比（binary 参考）")
     ap.add_argument("--test", type=int, default=20)
     ap.add_argument("--min-vars", type=int, default=4)
     ap.add_argument("--max-vars", type=int, default=5)
@@ -200,8 +199,7 @@ def main() -> None:
     svc = BranchingPolicyService(policy=policy)
 
     agg = {
-        "native": {"rlimit": 0.0},
-        "binary": {"rlimit": 0.0, "time_ms": 0.0, "match": 0.0},
+        "binary": {"rlimit": 0.0, "time_ms": 0.0},
         "vsids": {
             "rlimit": 0.0,
             # "solver rlimit": 0.0,
@@ -232,20 +230,18 @@ def main() -> None:
     with tqdm(total=len(insts), desc="test") as pbar:
         for inst in insts:
             hard, obj, sense = inst.as_tuple()
-            nat = solve_native(hard, obj, sense)
-            agg["native"]["rlimit"] += nat["rlimit"]
-            bin_ = solve_binary(
+            ref = solve_binary(
                 hard, obj, sense, z3_path=z3_path, timeout_s=args.binary_timeout
             )
-            agg["binary"]["rlimit"] += bin_.get("rlimit") or 0
-            agg["binary"]["time_ms"] += bin_.get("time_ms") or 0.0
-            agg["binary"]["match"] += 1.0 if bin_.get("value") == nat["value"] else 0.0
+            ref_val = ref.get("value")
+            agg["binary"]["rlimit"] += ref.get("rlimit") or 0
+            agg["binary"]["time_ms"] += ref.get("time_ms") or 0.0
             v = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
             for key in v.keys():
                 if key not in agg["vsids"]:
                     continue
                 agg["vsids"][key] += v[key]
-            agg["vsids"]["match"] += 1.0 if v["value"] == nat["value"] else 0.0
+            agg["vsids"]["match"] += 1.0 if v["value"] == ref_val else 0.0
             ln = solve_omt_with_decider(
                 hard,
                 obj,
@@ -256,11 +252,10 @@ def main() -> None:
                 if key not in agg["learned"]:
                     continue
                 agg["learned"][key] += ln[key]
-            agg["learned"]["match"] += 1.0 if ln["value"] == nat["value"] else 0.0
+            agg["learned"]["match"] += 1.0 if ln["value"] == ref_val else 0.0
             per_instance.append({
                 "instance_id": inst.instance_id,
-                "native": _stats_for_json(nat),
-                "binary": _stats_for_json(bin_),
+                "binary": _stats_for_json(ref),
                 "vsids": _stats_for_json(v),
                 "learned": _stats_for_json(ln),
             })
@@ -268,7 +263,7 @@ def main() -> None:
 
     n = max(1, len(insts))
     print(
-        f"=== 四臂对比（{len(insts)} 实例；rlimit/conflicts 越小越好，match=1 为与 native 一致）==="
+        f"=== 三臂对比（{len(insts)} 实例；binary 为参考；match=1 为与 binary 最优值一致）==="
     )
     # print(f"  native(z3 Optimize): rlimit={agg['native']['rlimit']/n:.0f}")
     # print(
@@ -287,7 +282,6 @@ def main() -> None:
     # print(
     #     "\nPhase 1 目标：learned 臂 match=1（管道正确）+ 可测量。Phase 2 再训练使其优于 VSIDS。"
     # )
-    agg["native"]["rlimit"] /= n
     for key in agg["binary"].keys():
         agg["binary"][key] /= n
     for key in agg["vsids"].keys():
@@ -297,6 +291,7 @@ def main() -> None:
 
     os.makedirs(ARTIFACTS, exist_ok=True)
     results = {
+        "reference": "binary",
         "summary": agg,
         "n_instances": len(insts),
         "z3_path": z3_path,
