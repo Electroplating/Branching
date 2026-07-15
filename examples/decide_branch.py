@@ -20,9 +20,12 @@ from omt_branching.model.device import gnn_device
 from omt_branching.model.inference import InferenceConfig
 from omt_branching.model.policy import BranchingPolicy
 from omt_branching.service import BranchingPolicyService, ServiceConfig
-from omt_branching.solver.rl_decide import DEFAULT_RL_COLLECT_WORKERS
-from omt_branching.model.policy import BranchingPolicy
-from omt_branching.service import BranchingPolicyService, ServiceConfig
+from omt_branching.solver.rl_decide import (
+    DEFAULT_RL_COLLECT_WORKERS,
+    DecideRLConfig,
+    DecideRLTrainer,
+    effective_rl_workers,
+)
 from omt_branching.solver import (
     # Z3Backend,
     generate_bool_lia_dataset,
@@ -313,13 +316,6 @@ def main() -> None:
             f"{hist[0].get('branch', 0):.3f} -> {hist[-1].get('branch', 0):.3f}"
         )
     if args.rl_iters > 0:
-        from omt_branching.solver.rl_decide import (
-            DEFAULT_RL_COLLECT_WORKERS,
-            DecideRLConfig,
-            DecideRLTrainer,
-            effective_rl_workers,
-        )
-
         rl_count = max(args.train, 40)
         rl_train = gen(
             rl_count, seed=1, min_vars=args.min_vars, max_vars=args.max_vars
