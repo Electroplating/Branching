@@ -1,14 +1,17 @@
-"""三臂对比：native z3 Optimize / VSIDS-decide / learned-decide（未训练 GNN）。
+"""四臂对比：native z3 Optimize / z3 二进制 / VSIDS-decide / learned-decide（未训练 GNN）。
 
-证明管道正确（learned 臂 == native）并测量 rlimit/conflicts/decisions。**本 Phase 不训练**，
-故 learned 未必优于 VSIDS——目的是管道 + 可测量，为 Phase 2（look-ahead imitation + RL）铺路。
+证明管道正确（learned 臂 == native）并测量 rlimit/conflicts/decisions；``solve_binary``
+作独立 z3 可执行文件参照。为 Phase 2（look-ahead imitation + RL）铺路。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
+import os
+import shutil
+from datetime import datetime, timezone
+from fractions import Fraction
 
 import torch
 
@@ -17,12 +20,82 @@ from omt_branching.service import BranchingPolicyService
 from omt_branching.solver import (
     # Z3Backend,
     generate_bool_lia_dataset,
+    solve_binary,
     solve_native,
     solve_omt_with_decider,
 )
+from omt_branching.solver.instance_gen import OMTInstance
+from omt_branching.solver.interfaces import Sense
 from omt_branching.solver.policy_decider import PolicyDecider
 
 from tqdm import tqdm
+
+ARTIFACTS = os.path.join(os.path.dirname(__file__), "artifacts")
+DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "decide_branch_dataset")
+
+
+def _json_value(v):
+    """把 Fraction / 其它非标量转为 JSON 可序列化形式。"""
+    if v is None:
+        return None
+    if isinstance(v, Fraction):
+        return str(v)
+    if isinstance(v, Sense):
+        return v.value
+    return v
+
+
+def _instance_to_smt2(inst: OMTInstance) -> str:
+    """将 OMTInstance 导出为可人工核查的 SMT-LIB2 文本。"""
+    lines = ["(set-logic QF_LIA)"]
+    for v in inst.variables:
+        lines.append(f"(declare-fun {v} () Int)")
+    for h in inst.hard:
+        lines.append(f"(assert {h.sexpr()})")
+    obj = inst.objective.sexpr()
+    if inst.sense is Sense.MAX:
+        lines.append(f"(maximize {obj})")
+    else:
+        lines.append(f"(minimize {obj})")
+    lines.append("(check-sat)")
+    return "\n".join(lines) + "\n"
+
+
+def _instance_manifest_entry(inst: OMTInstance, *, smt2_relpath: str) -> dict:
+    return {
+        "instance_id": inst.instance_id,
+        "theory": inst.theory,
+        "family": inst.family,
+        "description": inst.description,
+        "sense": inst.sense.value,
+        "n_vars": len(inst.variables),
+        "n_hard": len(inst.hard),
+        "obj_coeffs": inst.obj_coeffs,
+        "smt2": smt2_relpath,
+    }
+
+
+def save_dataset(
+    instances: list[OMTInstance],
+    out_dir: str,
+    *,
+    split: str,
+) -> list[dict]:
+    """把实例列表落盘：每个实例一个 .smt2，返回 manifest 条目。"""
+    split_dir = os.path.join(out_dir, split)
+    os.makedirs(split_dir, exist_ok=True)
+    entries: list[dict] = []
+    for inst in instances:
+        fname = f"{inst.instance_id}.smt2"
+        relpath = os.path.join(split, fname).replace("\\", "/")
+        with open(os.path.join(split_dir, fname), "w", encoding="utf-8") as f:
+            f.write(_instance_to_smt2(inst))
+        entries.append(_instance_manifest_entry(inst, smt2_relpath=relpath))
+    return entries
+
+
+def _stats_for_json(stats: dict) -> dict:
+    return {k: _json_value(v) for k, v in stats.items()}
 
 
 def main() -> None:
@@ -37,7 +110,28 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--rl-iters", type=int, default=0, help="RL 微调轮数(0=不做 RL)")
     ap.add_argument("--hard", action="store_true", help="用更难实例(headroom)")
+    ap.add_argument(
+        "--dataset-dir",
+        default=DEFAULT_DATASET_DIR,
+        help="数据集落盘目录（manifest + SMT2）；默认 examples/artifacts/decide_branch_dataset",
+    )
+    ap.add_argument(
+        "--no-save-dataset",
+        action="store_true",
+        help="不保存数据集（仅跑实验并写 results.json）",
+    )
+    ap.add_argument("--z3-path", default=None, help="z3 可执行文件路径（默认同 PATH）")
+    ap.add_argument(
+        "--binary-timeout",
+        type=int,
+        default=1200,
+        help="单实例 z3 二进制超时（秒）",
+    )
     args = ap.parse_args()
+
+    z3_path = args.z3_path or shutil.which("z3")
+    if not z3_path:
+        raise SystemExit("未找到 z3 二进制，请用 --z3-path 指定")
 
     from omt_branching.solver import generate_hard_bool_lia_dataset
 
@@ -45,14 +139,42 @@ def main() -> None:
 
     torch.manual_seed(0)
     insts = gen(args.test, seed=99, min_vars=args.min_vars, max_vars=args.max_vars)
+    train_insts: list[OMTInstance] = []
+
+    if not args.no_save_dataset:
+        os.makedirs(args.dataset_dir, exist_ok=True)
+        gen_name = "hard_bool_lia" if args.hard else "bool_lia"
+        manifest = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "generator": gen_name,
+            "params": {
+                "test": args.test,
+                "train": args.train,
+                "min_vars": args.min_vars,
+                "max_vars": args.max_vars,
+                "hard": args.hard,
+                "refocus": args.refocus,
+                "epochs": args.epochs,
+                "rl_iters": args.rl_iters,
+            },
+            "seeds": {"test": 99, "train": 1},
+            "splits": {},
+        }
+        manifest["splits"]["test"] = save_dataset(insts, args.dataset_dir, split="test")
+        print(f"测试集 {len(insts)} 个实例已保存 -> {args.dataset_dir}/test/")
 
     policy = BranchingPolicy()
     if args.train > 0:
         from omt_branching.model.trainer import ImitationTrainer, TrainConfig
         from omt_branching.solver.training_data import build_lookahead_examples
 
-        train = gen(args.train, seed=1, min_vars=args.min_vars, max_vars=args.max_vars)
-        exs = [e for e in build_lookahead_examples(train) if e.bool_target_scores]
+        train_insts = gen(args.train, seed=1, min_vars=args.min_vars, max_vars=args.max_vars)
+        if not args.no_save_dataset:
+            manifest["splits"]["train"] = save_dataset(
+                train_insts, args.dataset_dir, split="train"
+            )
+            print(f"训练集 {len(train_insts)} 个实例已保存 -> {args.dataset_dir}/train/")
+        exs = [e for e in build_lookahead_examples(train_insts) if e.bool_target_scores]
         hist = ImitationTrainer(policy, TrainConfig(lr=5e-3)).fit(
             exs, epochs=args.epochs
         )
@@ -79,6 +201,7 @@ def main() -> None:
 
     agg = {
         "native": {"rlimit": 0.0},
+        "binary": {"rlimit": 0.0, "time_ms": 0.0, "match": 0.0},
         "vsids": {
             "rlimit": 0.0,
             # "solver rlimit": 0.0,
@@ -105,23 +228,18 @@ def main() -> None:
             "match": 0.0,
         },
     }
-    skipped = 0
+    per_instance: list[dict] = []
     with tqdm(total=len(insts), desc="test") as pbar:
         for inst in insts:
             hard, obj, sense = inst.as_tuple()
-            # if h:
-            #     rewards = [col["reward"] for col in h]
-            #     rlimit_max = math.exp(-min(rewards))-1
-            #     rlimit_bound = int(rlimit_max * 100)
-            # else:
-            #     rlimit_bound = -1
-            rlimit_bound = -1
-            nat = solve_native(hard, obj, sense, max_rlimit=rlimit_bound)
-            if nat["value"] is None:
-                skipped += 1
-                pbar.update(1)
-                continue
+            nat = solve_native(hard, obj, sense)
             agg["native"]["rlimit"] += nat["rlimit"]
+            bin_ = solve_binary(
+                hard, obj, sense, z3_path=z3_path, timeout_s=args.binary_timeout
+            )
+            agg["binary"]["rlimit"] += bin_.get("rlimit") or 0
+            agg["binary"]["time_ms"] += bin_.get("time_ms") or 0.0
+            agg["binary"]["match"] += 1.0 if bin_.get("value") == nat["value"] else 0.0
             v = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
             for key in v.keys():
                 if key not in agg["vsids"]:
@@ -139,11 +257,18 @@ def main() -> None:
                     continue
                 agg["learned"][key] += ln[key]
             agg["learned"]["match"] += 1.0 if ln["value"] == nat["value"] else 0.0
+            per_instance.append({
+                "instance_id": inst.instance_id,
+                "native": _stats_for_json(nat),
+                "binary": _stats_for_json(bin_),
+                "vsids": _stats_for_json(v),
+                "learned": _stats_for_json(ln),
+            })
             pbar.update(1)
 
-    n = max(1, len(insts)) - skipped
+    n = max(1, len(insts))
     print(
-        f"=== 三臂对比（{len(insts)} 实例，未训练 GNN；rlimit/conflicts 越小越好，match=1 为正确）==="
+        f"=== 四臂对比（{len(insts)} 实例；rlimit/conflicts 越小越好，match=1 为与 native 一致）==="
     )
     # print(f"  native(z3 Optimize): rlimit={agg['native']['rlimit']/n:.0f}")
     # print(
@@ -163,12 +288,30 @@ def main() -> None:
     #     "\nPhase 1 目标：learned 臂 match=1（管道正确）+ 可测量。Phase 2 再训练使其优于 VSIDS。"
     # )
     agg["native"]["rlimit"] /= n
+    for key in agg["binary"].keys():
+        agg["binary"][key] /= n
     for key in agg["vsids"].keys():
         agg["vsids"][key] /= n
     for key in agg["learned"].keys():
         agg["learned"][key] /= n
-    with open("examples/artifacts/results.json", "w") as f:
-        json.dump(agg, f, indent=4)
+
+    os.makedirs(ARTIFACTS, exist_ok=True)
+    results = {
+        "summary": agg,
+        "n_instances": len(insts),
+        "z3_path": z3_path,
+        "per_instance": per_instance,
+    }
+    results_path = os.path.join(ARTIFACTS, "results.json")
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=4, ensure_ascii=False)
+    print(f"实验汇总已保存 -> {results_path}")
+
+    if not args.no_save_dataset:
+        manifest_path = os.path.join(args.dataset_dir, "manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=4, ensure_ascii=False)
+        print(f"数据集清单已保存 -> {manifest_path}")
 
 
 if __name__ == "__main__":

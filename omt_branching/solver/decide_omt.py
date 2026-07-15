@@ -1,14 +1,20 @@
 """OMT = 单 z3.Solver 线性搜索回路（Solve + Better-cut，直到 UNSAT），可挂
 LearnedDecidePropagator 接管内部布尔决策。z3.Optimize 不支持 propagator，故必须走此回路。
 
-三臂对比：decider_factory=None -> VSIDS 臂；给 PolicyDecider -> learned 臂；native 见 solve_native。
+对比臂：``solve_native``（Python Optimize API）、``solve_binary``（z3 二进制 ``-st``）、
+``solve_omt_with_decider``（VSIDS / learned UserPropagator 回路）。
 """
 
 from __future__ import annotations
 
 from fractions import Fraction
-import math
-from time import perf_counter_ns
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from time import perf_counter
+from typing import Optional
 
 import z3
 
@@ -154,7 +160,152 @@ def solve_native(
     }
 
 
+def _collect_vars(hard, obj) -> list:
+    """从硬约束与目标中收集算术变量（去重、按名排序）。"""
+    seen: dict[str, object] = {}
+
+    def visit(expr) -> None:
+        if z3.is_const(expr) and expr.decl().arity() == 0:
+            if z3.is_int(expr) or z3.is_real(expr):
+                seen[str(expr)] = expr
+        for child in expr.children():
+            visit(child)
+
+    for h in hard:
+        visit(h)
+    visit(obj)
+    return [seen[k] for k in sorted(seen)]
+
+
+def _has_or(expr) -> bool:
+    if z3.is_or(expr):
+        return True
+    return any(_has_or(c) for c in expr.children())
+
+
+def _smt_logic_and_sort(hard, variables: list) -> tuple[str, str]:
+    if any(z3.is_real(v) for v in variables):
+        return "QF_LRA", "Real"
+    if any(_has_or(h) for h in hard):
+        return "ALL", "Int"
+    return "QF_LIA", "Int"
+
+
+def _hard_to_smt2(hard, obj, sense: Sense) -> str:
+    """把 ``(hard, obj, sense)`` 编成 z3 二进制可读的 OMT SMT-LIB2。"""
+    variables = _collect_vars(hard, obj)
+    logic, var_sort = _smt_logic_and_sort(hard, variables)
+    obj_sexpr = obj.sexpr()
+    sense_cmd = "maximize" if sense is Sense.MAX else "minimize"
+    lines = [
+        f"(set-logic {logic})",
+        "(set-option :produce-models true)",
+    ]
+    for v in variables:
+        lines.append(f"(declare-fun {v.decl().name()} () {var_sort})")
+    for h in hard:
+        lines.append(f"(assert {h.sexpr()})")
+    lines.append(f"({sense_cmd} {obj_sexpr})")
+    lines.append("(check-sat)")
+    lines.append(f"(get-value ({obj_sexpr}))")
+    return "\n".join(lines) + "\n"
+
+
+def _parse_smt_num(token: str) -> Optional[Fraction]:
+    token = token.strip()
+    if not token:
+        return None
+    if token.startswith("(/"):
+        inner = token.strip("()")
+        parts = inner.split()
+        if len(parts) == 3 and parts[0] == "/":
+            return Fraction(int(parts[1]), int(parts[2]))
+        return None
+    try:
+        return Fraction(int(token))
+    except ValueError:
+        return None
+
+
+def _parse_get_value(stdout: str) -> Optional[Fraction]:
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("((("):
+            continue
+        m = re.search(r"\)\s+(\S+)\)\)$", line)
+        if m is None:
+            continue
+        return _parse_smt_num(m.group(1))
+    return None
+
+
+def _parse_rlimit(stdout: str) -> int:
+    m = re.search(r":rlimit-count\s+(\d+)", stdout)
+    return int(m.group(1)) if m else 0
+
+
+def _parse_sat(stdout: str) -> str:
+    for line in stdout.splitlines():
+        s = line.strip()
+        if s in ("sat", "unsat", "unknown"):
+            return s
+    return "error"
+
+
+def solve_binary(
+    hard,
+    obj,
+    sense: Sense,
+    *,
+    z3_path: str | None = None,
+    timeout_s: int = 120,
+) -> dict:
+    """用 z3 二进制（``z3 -st``）求解 OMT，返回 ``value``/``rlimit``（与 :func:`solve_native` 对齐）。"""
+    exe = z3_path or shutil.which("z3")
+    if not exe:
+        raise FileNotFoundError("未找到 z3 二进制，请安装 z3 或通过 z3_path 指定")
+
+    smt2 = _hard_to_smt2(hard, obj, sense)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".smt2", delete=False, encoding="ascii"
+    ) as tmp:
+        tmp.write(smt2)
+        path = tmp.name
+    try:
+        t0 = perf_counter()
+        proc = subprocess.run(
+            [exe, "-st", path],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        elapsed_ms = (perf_counter() - t0) * 1000.0
+    except subprocess.TimeoutExpired:
+        return {
+            "value": None,
+            "rlimit": None,
+            "time_ms": timeout_s * 1000.0,
+            "status": "timeout",
+            "stderr": "timeout",
+        }
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+    stdout = proc.stdout or ""
+    status = _parse_sat(stdout)
+    rlimit = _parse_rlimit(stdout)
+    value = _parse_get_value(stdout) if status == "sat" else None
+    return {
+        "value": value,
+        "rlimit": rlimit,
+        "time_ms": elapsed_ms,
+        "status": status,
+        "stderr": (proc.stderr or "").strip(),
+    }
+
+
 __all__ = [
     "solve_omt_with_decider",
     "solve_native",
+    "solve_binary",
 ]

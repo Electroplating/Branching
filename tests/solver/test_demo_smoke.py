@@ -35,7 +35,7 @@ def test_decide_branch_smoke():
         capture_output=True, text=True, timeout=600,
     )
     assert out.returncode == 0, out.stderr
-    assert "三臂对比" in out.stdout
+    assert "四臂对比" in out.stdout
 
 
 def test_lia_branch_smoke_reaches_native():
