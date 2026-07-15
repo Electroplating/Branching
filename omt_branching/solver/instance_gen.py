@@ -158,6 +158,20 @@ def generate_bool_lia_dataset(count: int, seed: int = 0, *, id_prefix: str = "bl
     return out
 
 
+def bool_lia_instance_at(
+    index: int,
+    seed: int,
+    *,
+    hard: bool = False,
+    min_vars: int = 5,
+    max_vars: int = 7,
+    **kwargs,
+) -> OMTInstance:
+    """复现 ``gen(count=index+1, seed=seed)[index]``（供进程池 worker 独立 z3 上下文）。"""
+    gen = generate_hard_bool_lia_dataset if hard else generate_bool_lia_dataset
+    return gen(index + 1, seed=seed, min_vars=min_vars, max_vars=max_vars, **kwargs)[index]
+
+
 def generate_hard_bool_lia_dataset(count: int, seed: int = 0, *, id_prefix: str = "hblia",
                                    min_vars: int = 6, max_vars: int = 8, **kwargs) -> list[OMTInstance]:
     """更难的布尔结构整数 OMT：更多析取(n_disj=24)、更大子句(k=4)、更紧原子池(pool_mult=1)，
@@ -530,6 +544,7 @@ __all__ = [
     "generate_hard_lia_dataset",
     "generate_bool_lia_instance",
     "generate_bool_lia_dataset",
+    "bool_lia_instance_at",
     "generate_hard_bool_lia_dataset",
     "generate_lra_instance",
     "generate_lra_dataset",

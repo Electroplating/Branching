@@ -182,36 +182,108 @@ def bool_branch_hit(policy: BranchingPolicy, instance: OMTInstance,
     return graph.solver_id(NodeType.BOOL_VAR, local) == oracle_bid
 
 
+DEFAULT_LOOKAHEAD_WORKERS = 12
+
+
+def _build_lookahead_one(
+    inst: OMTInstance, config
+) -> RankingExample | None:
+    """单实例 look-ahead 标签；无有效 bool 候选时返回 None。"""
+    from omt_branching.solver.lookahead import lookahead_scores
+    from omt_branching.solver.propagator_snapshot import build_bool_snapshot
+
+    hard = list(inst.hard)
+    snap, amap = build_bool_snapshot(hard)
+    graph = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
+    scores, phases = lookahead_scores(hard, atoms=list(amap.values()), config=config)
+    bmap = graph.id_maps.get(NodeType.BOOL_VAR, {})
+    bts: dict[int, float] = {}
+    pts: dict[int, bool] = {}
+    for k, sc in scores.items():
+        loc = bmap.get(k)
+        if loc is not None:
+            bts[loc] = sc
+    for k, ph in phases.items():
+        loc = bmap.get(k)
+        if loc is not None:
+            pts[loc] = ph
+    if not bts:
+        return None
+    return RankingExample(graph=graph, bool_target_scores=bts, phase_targets=pts)
+
+
+def _lookahead_example_worker(task: tuple) -> tuple[int, RankingExample | None]:
+    """ProcessPool worker：按 index/seed 重建实例并构造 look-ahead 样本。"""
+    index, seed, hard, min_vars, max_vars, max_atoms, eps = task
+    from omt_branching.solver.instance_gen import bool_lia_instance_at
+    from omt_branching.solver.lookahead import LookaheadConfig
+
+    inst = bool_lia_instance_at(
+        index, seed, hard=hard, min_vars=min_vars, max_vars=max_vars
+    )
+    cfg = LookaheadConfig(max_atoms=max_atoms, eps=eps)
+    return index, _build_lookahead_one(inst, cfg)
+
+
 def build_lookahead_examples(instances, config=None):
     """从布尔结构实例构造 look-ahead imitation 样本（bool head ranking + phase）。
 
     对每个实例的根状态 ``build_bool_snapshot`` 建图，``lookahead_scores`` 打标签（传播强度），
     映射 atom_key -> 图内 BOOL_VAR 局部索引，填 ``bool_target_scores`` + ``phase_targets``。
     """
-    from omt_branching.solver.lookahead import LookaheadConfig, lookahead_scores
-    from omt_branching.solver.propagator_snapshot import build_bool_snapshot
+    from omt_branching.solver.lookahead import LookaheadConfig
 
     cfg = config or LookaheadConfig()
     out: list[RankingExample] = []
     for inst in instances:
-        hard = list(inst.hard)
-        snap, amap = build_bool_snapshot(hard)
-        graph = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
-        scores, phases = lookahead_scores(hard, atoms=list(amap.values()), config=cfg)
-        bmap = graph.id_maps.get(NodeType.BOOL_VAR, {})
-        bts: dict[int, float] = {}
-        pts: dict[int, bool] = {}
-        for k, sc in scores.items():
-            loc = bmap.get(k)
-            if loc is not None:
-                bts[loc] = sc
-        for k, ph in phases.items():
-            loc = bmap.get(k)
-            if loc is not None:
-                pts[loc] = ph
-        if bts:
-            out.append(RankingExample(graph=graph, bool_target_scores=bts, phase_targets=pts))
+        ex = _build_lookahead_one(inst, cfg)
+        if ex is not None:
+            out.append(ex)
     return out
+
+
+def build_lookahead_examples_parallel(
+    count: int,
+    *,
+    seed: int = 1,
+    hard: bool = False,
+    min_vars: int = 5,
+    max_vars: int = 7,
+    config=None,
+    workers: int = DEFAULT_LOOKAHEAD_WORKERS,
+) -> list[RankingExample]:
+    """多进程构造 look-ahead 样本；worker 内按 index/seed 重建实例（z3 非线程安全）。"""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    from omt_branching.solver.instance_gen import (
+        bool_lia_instance_at,
+        generate_bool_lia_dataset,
+        generate_hard_bool_lia_dataset,
+    )
+    from omt_branching.solver.lookahead import LookaheadConfig
+
+    if count <= 0:
+        return []
+    cfg = config or LookaheadConfig()
+    if workers <= 1:
+        gen = generate_hard_bool_lia_dataset if hard else generate_bool_lia_dataset
+        return build_lookahead_examples(
+            gen(count, seed=seed, min_vars=min_vars, max_vars=max_vars), config=cfg
+        )
+
+    workers = min(workers, count)
+    max_atoms, eps = cfg.max_atoms, cfg.eps
+    tasks = [
+        (i, seed, hard, min_vars, max_vars, max_atoms, eps) for i in range(count)
+    ]
+    slots: list[RankingExample | None] = [None] * count
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_lookahead_example_worker, t) for t in tasks]
+        for fut in as_completed(futures):
+            index, ex = fut.result()
+            if ex is not None:
+                slots[index] = ex
+    return [ex for ex in slots if ex is not None]
 
 
 def build_lookahead_examples_sat(problems, config=None):
@@ -242,9 +314,11 @@ def build_lookahead_examples_sat(problems, config=None):
 
 
 __all__ = [
+    "DEFAULT_LOOKAHEAD_WORKERS",
     "build_imitation_example",
     "build_imitation_examples",
     "build_lookahead_examples",
+    "build_lookahead_examples_parallel",
     "build_lookahead_examples_sat",
     "policy_numeric_choice",
     "baseline_numeric_choice",

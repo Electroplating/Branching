@@ -92,13 +92,11 @@ def _regenerate_test_instance(
     max_vars: int,
 ) -> OMTInstance:
     """复现 ``gen(count=index+1, seed=seed)[index]``（供进程池 worker 独立 z3 上下文）。"""
-    from omt_branching.solver import (
-        generate_bool_lia_dataset,
-        generate_hard_bool_lia_dataset,
-    )
+    from omt_branching.solver.instance_gen import bool_lia_instance_at
 
-    gen = generate_hard_bool_lia_dataset if hard else generate_bool_lia_dataset
-    return gen(index + 1, seed=seed, min_vars=min_vars, max_vars=max_vars)[index]
+    return bool_lia_instance_at(
+        index, seed, hard=hard, min_vars=min_vars, max_vars=max_vars
+    )
 
 
 def _eval_test_worker(task: tuple) -> dict:
@@ -227,7 +225,7 @@ def main() -> None:
         "--test-workers",
         type=int,
         default=DEFAULT_TEST_WORKERS,
-        help=f"测试阶段并发实例数（默认 {DEFAULT_TEST_WORKERS}）",
+        help=f"测试与 look-ahead 标签构建并发数（默认 {DEFAULT_TEST_WORKERS}）",
     )
     ap.add_argument(
         "--device",
@@ -276,7 +274,7 @@ def main() -> None:
     policy = BranchingPolicy()
     if args.train > 0:
         from omt_branching.model.trainer import ImitationTrainer, TrainConfig
-        from omt_branching.solver.training_data import build_lookahead_examples
+        from omt_branching.solver.training_data import build_lookahead_examples_parallel
 
         train_insts = gen(args.train, seed=1, min_vars=args.min_vars, max_vars=args.max_vars)
         if not args.no_save_dataset:
@@ -284,7 +282,20 @@ def main() -> None:
                 train_insts, args.dataset_dir, split="train"
             )
             print(f"训练集 {len(train_insts)} 个实例已保存 -> {args.dataset_dir}/train/")
-        exs = [e for e in build_lookahead_examples(train_insts) if e.bool_target_scores]
+        lookahead_workers = args.test_workers
+        print(f"look-ahead 标签构建: {args.train} 实例, workers={lookahead_workers}")
+        exs = [
+            e
+            for e in build_lookahead_examples_parallel(
+                args.train,
+                seed=1,
+                hard=args.hard,
+                min_vars=args.min_vars,
+                max_vars=args.max_vars,
+                workers=lookahead_workers,
+            )
+            if e.bool_target_scores
+        ]
         hist = ImitationTrainer(policy, TrainConfig(lr=5e-3, device=device)).fit(
             exs, epochs=args.epochs
         )
