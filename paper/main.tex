@@ -1,0 +1,750 @@
+%% ==========================================================================
+%% NeuralOMT — 学习驱动的内部布尔分支 (AAAI 2027 匿名投稿草稿)
+%%
+%% 编译:  pdflatex main ; bibtex main ; pdflatex main ; pdflatex main
+%% 依赖:  aaai2027.sty, aaai2027.bst, references.bib (均在本目录)
+%%
+%% 说明:实验表格已按论文结构写好、结果单元格留空(\blank),待最终跑批填入。
+%% ==========================================================================
+\documentclass[letterpaper]{article} % DO NOT CHANGE THIS
+\usepackage[submission]{aaai2027}  % DO NOT CHANGE THIS
+\usepackage[hyphens]{url}  % DO NOT CHANGE THIS
+\usepackage{graphicx} % DO NOT CHANGE THIS
+\urlstyle{rm} % DO NOT CHANGE THIS
+\def\UrlFont{\rm}  % DO NOT CHANGE THIS
+\usepackage{natbib}  % DO NOT CHANGE THIS AND DO NOT ADD ANY OPTIONS TO IT
+\usepackage{caption} % DO NOT CHANGE THIS AND DO NOT ADD ANY OPTIONS TO IT
+\frenchspacing  % DO NOT CHANGE THIS
+
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{booktabs}
+
+% 数学环境(标准包,AAAI 允许)
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+
+\pdfinfo{
+/TemplateVersion (2027.1)
+}
+
+\setcounter{secnumdepth}{2} % 采用编号章节(形式化论文风格)
+
+% ---- 定理类环境 ----
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{example}{Example}
+\theoremstyle{plain}
+\newtheorem{proposition}{Proposition}
+\newtheorem{theorem}{Theorem}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+% ---- 常用宏 ----
+\newcommand{\blank}{\,\rule[-.1ex]{2.2em}{0.4pt}\,} % 留空的结果单元格
+\newcommand{\solver}{\textsc{z3}}
+\newcommand{\Imp}{\mathrm{Imp}}
+\newcommand{\score}{\mathrm{score}}
+\newcommand{\decide}{\textsf{add\_decide}}
+\newcommand{\nextsplit}{\textsf{next\_split}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\Atoms}{\mathcal{A}}
+\newcommand{\Undec}{U}
+\newcommand{\defer}{\bot}
+\newcommand{\policy}{\pi_\theta}
+\newcommand{\confl}{\texttt{conflicts}}
+\newcommand{\rlimit}{\texttt{rlimit}}
+\DeclareMathOperator*{\meanop}{mean}
+
+% ---- 标题(mixed case) ----
+\title{When Does Learned Boolean Branching Help Inside {CDCL(T)}?\\
+A Non-Intrusive Neural Mechanism and an Honest Study}
+
+\author{
+    Anonymous Submission
+}
+\affiliations{
+    Paper under double-blind review
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Modern SMT and Optimization Modulo Theories (OMT) solvers spend much of
+their effort in a \textsc{CDCL(T)} search whose efficiency hinges on the
+Boolean branching heuristic (typically VSIDS). Whether a \emph{learned}
+heuristic can improve on VSIDS \emph{inside a production solver, without
+modifying it}, remains largely open---especially beyond pure propositional
+SAT. We present a non-intrusive mechanism that injects a learned decision
+policy into the internal \textsc{CDCL(T)} decisions of an unmodified
+\solver{} through its \textsc{UserPropagator} interface, and we formalize
+it as a \emph{decision oracle} over a black-box \textsc{CDCL(T)} procedure.
+We prove that the mechanism preserves soundness and completeness, and we
+give a measurement protocol that isolates branching quality by attaching a
+(possibly inert) propagator to \emph{both} compared arms, so that they
+explore the same unpreprocessed search space. On top of the mechanism we
+build a heterogeneous-graph neural policy trained by a consequence-based
+look-ahead teacher (imitation) and by REINFORCE with a per-instance
+baseline. We study the policy on hard random 3-SAT, on SMT(LIA) instances
+with rich theory-atom structure, and in the OMT optimization loop. Our
+central finding is a \emph{boundary}: a learned quasi-static, full-coverage
+decision order improves on VSIDS on pure-Boolean SAT, but does \emph{not}
+on theory atoms or in the OMT loop; a systematic root-cause analysis
+attributes the gap to VSIDS's conflict-adaptive dynamics rather than to the
+teacher signal. We release the instance generators, harnesses, and test
+suite. \emph{(Empirical tables are scaffolded; result cells are to be filled
+from final runs.)}
+\end{abstract}
+
+% ==========================================================================
+\section{Introduction}
+% ==========================================================================
+
+Satisfiability Modulo Theories (SMT) solvers are the workhorses of
+verification, synthesis, and constraint solving, and Optimization Modulo
+Theories (OMT) extends them to problems whose solutions must be optimal with
+respect to an objective~\citep{barrett2021smt,sebastiani2015pushing,bjorner2015nz}.
+At the heart of a modern solver lies a \textsc{CDCL(T)} loop
+\citep{nieuwenhuis2006dpllt}: a conflict-driven clause-learning SAT engine
+over the Boolean abstraction of the formula, tightly coupled with theory
+propagation. The efficiency of that loop is famously sensitive to one
+component---the \emph{branching heuristic} that chooses which Boolean atom
+to case-split on and with what phase. The de-facto standard, VSIDS
+\citep{moskewicz2001chaff}, is a cheap, conflict-adaptive scoring rule that
+has resisted improvement for two decades.
+
+Machine learning has repeatedly been proposed to \emph{learn} better
+branching decisions. In mixed-integer programming, graph neural networks
+imitate strong branching with striking success
+\citep{gasse2019exact,nair2020solving}; in propositional SAT, neural models
+either learn end-to-end solvers \citep{selsam2019neurosat} or learn a
+branching policy by reinforcement learning \citep{kurin2020graphqsat}. Yet
+two gaps persist. \emph{First}, almost all of this work either builds a
+bespoke research solver or patches the source of an existing one, whereas
+production SMT/OMT solvers are complex, highly tuned black boxes that
+practitioners are reluctant to fork. \emph{Second}, the evidence is
+concentrated on a single regime---pure SAT or pure MILP---and says little
+about whether learned branching transfers to the \emph{theory} reasoning of
+\textsc{CDCL(T)} or to the outer optimization loop of OMT.
+
+This paper addresses both gaps. We observe that a mature solver,
+\solver{}~\citep{demoura2008z3}, exposes a \emph{supported, non-intrusive}
+seam---the \textsc{UserPropagator} API, whose \decide{}/\nextsplit{}
+callbacks let an external policy dictate the solver's next internal
+\textsc{CDCL(T)} decision without recompiling the solver. We turn this
+engineering seam into a clean formal object: a \emph{decision oracle} over a
+black-box \textsc{CDCL(T)} procedure. We prove that any oracle of the right
+shape preserves soundness and completeness, and we identify a subtle but
+crucial measurement issue: attaching a propagator disables \solver{}'s
+preprocessing, so a fair comparison must attach a (possibly inert)
+propagator to \emph{both} arms. On top of the mechanism we build a
+graph-neural policy trained by a look-ahead teacher and reinforcement
+learning, and we run it across the SAT $\to$ SMT(LIA) $\to$ OMT spectrum.
+
+The result is an honest characterization rather than a uniform win. On hard
+random 3-SAT the learned policy reduces conflicts relative to VSIDS; on
+SMT(LIA) theory atoms and in the OMT loop it does not. A systematic probe
+localizes the cause: the \emph{learnability} of the look-ahead signal and
+the \emph{utility} of the resulting policy are separate questions---a
+learned quasi-static full-coverage order can beat VSIDS on a purely
+propositional clause graph, but it loses to VSIDS's conflict-adaptive
+dynamics once decisions range over theory atoms, and branching is simply not
+the bottleneck inside the OMT linear-search loop.
+
+\paragraph{Contributions.}
+\begin{itemize}
+\item \textbf{A non-intrusive formal mechanism} (Section~\ref{sec:mechanism}):
+we model external control of a black-box \textsc{CDCL(T)} solver's internal
+branching as a \emph{decision oracle} $\delta$, realize it via
+\solver{}'s \textsc{UserPropagator}, and prove it preserves soundness and
+completeness (Proposition~\ref{prop:sc}). We give a measurement protocol
+that isolates branching quality (Section~\ref{sec:isolation}) and show how
+OMT is handled as a degenerate Generalized-OMT linear search.
+\item \textbf{A neural instantiation} (Section~\ref{sec:policy}): a
+heterogeneous-graph GNN policy with a consequence-based look-ahead teacher
+for imitation cold-start and a REINFORCE objective with a per-instance
+baseline, including a theory-atom structural encoding that makes the
+imitation signal learnable.
+\item \textbf{An honest empirical study} (Sections~\ref{sec:setup}--\ref{sec:results}):
+a paired, seed-disjoint protocol across hard 3-SAT, SMT(LIA), and the OMT
+loop, with a root-cause analysis separating learnability from solving
+utility.
+\item \textbf{Reusable artifacts}: instance generators, both evaluation
+harnesses, and a passing test suite, released to support replication.
+\end{itemize}
+
+% ==========================================================================
+\section{Background and Related Work}
+% ==========================================================================
+
+\paragraph{SMT, CDCL(T), and OMT.}
+Fix a background theory $\mathcal{T}$. A quantifier-free formula $\varphi$
+has a \emph{Boolean abstraction} obtained by replacing each theory atom
+(e.g.\ a linear-arithmetic comparison $\sum_i c_i x_i \bowtie b$) with a
+fresh Boolean variable. \textsc{CDCL(T)} \citep{nieuwenhuis2006dpllt}
+searches for a theory-consistent truth assignment to these atoms by
+interleaving Boolean unit propagation, theory propagation, and
+conflict-driven clause learning. At each \emph{decision point} the solver
+picks an unassigned atom and a phase; VSIDS \citep{moskewicz2001chaff}
+scores atoms by recent conflict participation, and refinements such as LRB
+\citep{liang2016lrb} learn the scoring online. \emph{Look-ahead} solvers
+\citep{heule2021lookahead} instead score a literal by how much propagation
+it triggers---the intuition our teacher signal formalizes. OMT
+\citep{sebastiani2015pushing,bjorner2015nz,trentin2019omt} augments SMT with
+an objective term to be optimized, typically by a linear or binary search
+that repeatedly tightens a bound and re-checks satisfiability.
+
+\paragraph{Generalized OMT.}
+\citet{gomt2024} give a theory-agnostic abstract calculus for OMT (GOMT)
+whose state $\langle \mathcal{I}, \Delta, \tau\rangle$ is manipulated by
+three derivation rules (\textsc{F-Split}, \textsc{F-Sat}, \textsc{F-Close})
+around a \textsc{Solve} oracle. A \emph{linear search} strategy in that
+calculus never splits and applies \textsc{F-Sat} until saturation. Our OMT
+harness is exactly this degenerate strategy: a \solver{} \texttt{Solver}
+loop that repeatedly checks $\varphi \wedge (\text{bound})$ and tightens the
+bound. This matters because \solver{}'s \texttt{Optimize} engine does
+\emph{not} accept a propagator, so learned branching can only be attached to
+the \texttt{Solver} checks inside the loop---placing our mechanism squarely
+at the \textsc{Solve} oracle of the GOMT calculus rather than at its outer
+branch ordering.
+
+\paragraph{Learning to branch.}
+The closest lines of work are neural branching for MILP
+\citep{gasse2019exact,nair2020solving} and for SAT
+\citep{selsam2019neurosat,kurin2020graphqsat}. We differ in three ways: (i)
+we target the \emph{theory}-level search of \textsc{CDCL(T)} and the OMT
+loop, not only propositional SAT or MILP; (ii) we inject the policy into an
+\emph{unmodified, production} solver through a supported API, rather than
+forking the solver; and (iii) we report a boundary result with a root-cause
+analysis, rather than a single-regime win. Methodologically we build on
+relational graph convolution \citep{schlichtkrull2018rgcn}, listwise ranking
+\citep{cao2007listnet}, and policy-gradient RL \citep{williams1992reinforce}.
+
+% ==========================================================================
+\section{A Non-Intrusive Mechanism for Learned Branching}
+\label{sec:mechanism}
+% ==========================================================================
+
+\subsection{The Decision-Oracle Abstraction}
+
+Let $S$ be a \textsc{CDCL(T)} decision procedure for $\mathcal{T}$-satisfiability
+of a quantifier-free formula $\varphi$ whose Boolean abstraction ranges over
+a finite atom set $\Atoms(\varphi)$. We model $S$'s search state as a pair
+$(M,\Undec)$, where $M$ is the current partial assignment (trail) over
+$\Atoms(\varphi)$ and $\Undec\subseteq\Atoms(\varphi)$ is the set of
+currently unassigned atoms.
+
+\begin{definition}[Decision oracle]
+\label{def:oracle}
+A \emph{decision oracle} is a function $\delta$ that maps a search state
+$(M,\Undec)$ either to a \emph{decision literal} $\ell$ over some atom
+$a\in\Undec$ (i.e.\ $a$ together with a phase), or to the distinguished value
+$\defer$ (``defer''). An oracle is \emph{well-formed} if it never returns a
+literal over an atom outside $\Undec$: it only chooses \emph{which
+unassigned atom to case-split next, and with what phase}; it adds and removes
+no atoms, clauses, or constraints.
+\end{definition}
+
+Write $S[\delta]$ for the procedure $S$ run so that, at every decision point,
+it decides $\ell$ next if $\delta(M,\Undec)=\ell$, and otherwise
+($\delta(M,\Undec)=\defer$) it decides using its native heuristic $h$
+(VSIDS). Algorithm~\ref{alg:cdclt} shows the decorated loop; the only change
+from stock \textsc{CDCL(T)} is line~\ref{line:oracle}.
+
+\begin{algorithm}[t]
+\caption{\textsc{CDCL(T)} with a decision oracle}
+\label{alg:cdclt}
+\begin{algorithmic}[1]
+\REQUIRE formula $\varphi$ over atoms $\Atoms$; native heuristic $h$; oracle $\delta$
+\STATE attach propagator $\Rightarrow$ disable preprocessing; $M \gets \emptyset$
+\LOOP
+  \STATE $(M,\mathit{st}) \gets \textsc{Propagate}(\varphi, M)$ \COMMENT{unit + theory propagation}
+  \IF{$\mathit{st} = \textsc{conflict}$}
+     \IF{top-level conflict} \RETURN \textsc{unsat} \ENDIF
+     \STATE analyze, learn clause, backjump$(M)$; \textbf{continue}
+  \ENDIF
+  \STATE $\Undec \gets \{a\in\Atoms : a \text{ unassigned in } M\}$
+  \IF{$\Undec = \emptyset$} \RETURN \textsc{sat} (model $M$) \ENDIF
+  \STATE $\ell \gets \delta(M,\Undec)$ \label{line:oracle} \COMMENT{learned override point}
+  \IF{$\ell = \defer$} \STATE $\ell \gets h(M,\Undec)$ \COMMENT{fall back to VSIDS} \ENDIF
+  \STATE $M \gets M \cup \{\,\text{decide } \ell\,\}$
+\ENDLOOP
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Realization via \textsc{UserPropagator}}
+
+\solver{} exposes \texttt{UserPropagateBase} with two hooks that implement
+Definition~\ref{def:oracle} without touching solver internals:
+\decide{}, invoked at each internal decision point, and \nextsplit{}$(a,
+\text{phase})$, by which the callback names the next literal to branch on.
+Returning without a call (``$\delta=\defer$'') hands control back to native
+VSIDS. Thus $\ell\gets\delta(M,\Undec)$ in Algorithm~\ref{alg:cdclt} is a
+single \decide{} callback, and the fallback of line~13 is automatic.
+
+\begin{remark}[Preprocessing side-effect]
+\label{rem:preproc}
+Attaching \emph{any} propagator makes \solver{} disable its
+preprocessing/in-processing and run a pure \textsc{CDCL(T)} search. This is
+central to our study: on preprocessed hard instances the conflict count can
+collapse to near zero, erasing the branching signal. Both arms must
+therefore attach a propagator (Section~\ref{sec:isolation}).
+\end{remark}
+
+\subsection{Soundness and Completeness}
+
+\begin{proposition}[Preservation]
+\label{prop:sc}
+Let $S$ be a sound and complete \textsc{CDCL(T)} procedure with a fair native
+heuristic $h$. For every well-formed decision oracle $\delta$
+(Definition~\ref{def:oracle}), $S[\delta]$ terminates and reports
+$\mathcal{T}$-sat iff $\varphi$ is $\mathcal{T}$-satisfiable, and
+$\mathcal{T}$-unsat otherwise. That is, $S[\delta]$ decides the same problem
+as $S$.
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+\textsc{CDCL(T)} is sound and complete under \emph{any} case-split strategy
+that (i) branches only on unassigned atoms of the finite set
+$\Atoms(\varphi)$ and (ii) is subject to the usual termination controls
+(conflict-driven learning with backjumping, plus a fair restart/decision
+policy so that no atom is starved). A well-formed $\delta$ satisfies (i) by
+construction, since it returns a literal only over an atom in $\Undec$. For
+(ii): whenever $\delta=\defer$ the fair native heuristic $h$ is used, and
+even when $\delta\neq\defer$ its choice comes from $\Undec$, so on every
+branch $\Undec$ strictly shrinks toward either a full model or a conflict;
+conflict analysis, clause learning, and backjumping are untouched. Decision
+\emph{order and phase} affect which conflicts are encountered first, hence
+runtime, but not the \emph{existence} of a satisfying assignment or of a
+refutation: a returned model still satisfies $\varphi$ and is
+theory-consistent, and an \textsc{unsat} answer is still certified by a
+resolution/theory-lemma refutation. Disabling preprocessing
+(Remark~\ref{rem:preproc}) changes the search but preserves
+sat-equivalence. Hence $S[\delta]$ and $S$ decide the same problem.
+\end{proof}
+
+Proposition~\ref{prop:sc} is what makes a \emph{learned} oracle safe: no
+matter how badly $\policy$ ranks atoms, correctness is never at risk, and
+$\policy=\defer$ recovers the native solver exactly.
+
+\subsection{Isolating Branching Quality}
+\label{sec:isolation}
+
+We instrument a single satisfiability check with three quantities returned by
+the harness \texttt{solve\_sat\_with\_decider}:
+\begin{align*}
+\confl &= \text{\solver{} statistic ``conflicts''},\\
+\rlimit &= \text{\solver{} statistic ``rlimit count''},\\
+\texttt{decisions} &= \#\{\text{steps with } \delta\neq\defer\}.
+\end{align*}
+Here $\confl$ is the direct proxy for branching quality (fewer is better),
+$\rlimit$ is an honest total-work counter that includes theory-solving cost,
+and $\texttt{decisions}$ counts only the steps at which the oracle actually
+overrode VSIDS.
+
+\begin{definition}[Paired measurement]
+\label{def:pairing}
+Both arms run $S[\delta]$ on the \emph{same} instance under an attached
+propagator: the \emph{baseline} arm uses $\delta\equiv\defer$ (pure native
+VSIDS, but with preprocessing disabled), and the \emph{learned} arm uses
+$\delta=\policy$. Because a propagator is attached in both arms, they explore
+the same unpreprocessed \textsc{CDCL(T)} search space and differ \emph{only}
+in the decision heuristic.
+\end{definition}
+
+Under Definition~\ref{def:pairing}, the difference in $\confl$ between the two
+arms isolates branching quality: it cannot be an artifact of one arm getting
+luckier preprocessing, because neither arm is preprocessed. We regard this
+protocol as a methodological contribution: it is easy to accidentally compare
+a propagator-decorated learned arm against a \emph{preprocessed} native
+baseline and thereby measure preprocessing, not branching.
+
+\subsection{OMT as a Degenerate GOMT Linear Search}
+\label{sec:omt}
+
+For an OMT problem $\langle t,\prec,\varphi\rangle$ we run the GOMT linear
+search of \citet{gomt2024}: repeatedly call \textsc{Solve} on $\varphi$
+conjoined with a $\prec$-tightening bound on $t$, updating the incumbent
+until the check is unsatisfiable. Since \solver{}'s \texttt{Optimize} rejects
+propagators, the oracle attaches to each \texttt{Solver} check in the loop.
+We flag one asymmetry honestly: in this harness only the learned arm attaches
+a propagator (the baseline uses stock \texttt{Optimize}), so the OMT
+comparison does not enjoy the clean isolation of
+Definition~\ref{def:pairing}; we return to its consequences in
+Section~\ref{sec:results}.
+
+% ==========================================================================
+\section{The Neural Branching Policy}
+\label{sec:policy}
+% ==========================================================================
+
+The oracle $\policy$ is a graph neural network trained in two stages:
+imitation of a look-ahead teacher (cold start), then REINFORCE fine-tuning.
+
+\subsection{Look-Ahead Teacher (Imitation Signal)}
+\label{sec:teacher}
+
+For each candidate atom $a$ we score its \emph{marginal propagation strength}
+using \solver{}'s \texttt{consequences} query, in the spirit of look-ahead
+solvers \citep{heule2021lookahead}. Let $\Imp(L)$ be the set of atom keys
+forced to a value under the hypothesis set $L$, and let
+$B=\Imp(\varnothing)$ be the atoms entailed by the hard constraints alone
+(the baseline). Define
+\begin{align*}
+p_t(a) &= \bigl|\Imp(\{a\})\setminus B\setminus\{a\}\bigr|,\\
+p_f(a) &= \bigl|\Imp(\{\neg a\})\setminus B\setminus\{a\}\bigr|,
+\end{align*}
+and set the teacher score and phase
+\begin{equation}
+\begin{aligned}
+\score(a) &= \bigl(p_t(a)+1\bigr)\bigl(p_f(a)+1\bigr),\\
+\mathrm{phase}(a) &= \mathbb{1}[\,p_t(a)\ge p_f(a)\,].
+\end{aligned}
+\label{eq:teacher}
+\end{equation}
+The $+1$ bias keeps atoms that propagate nothing comparable (score $1$, not
+$0$); subtracting the baseline $B$ is essential, since box/entailed atoms
+otherwise ``imply'' the same set under every hypothesis and the labels
+degenerate to uniform. Atoms that are already \textsc{unsat} on one side at
+the root are skipped: they are resolved by propagation, not by branching. A
+configuration \texttt{max\_atoms} caps how many atoms are scored per state.
+
+\begin{remark}
+The teacher counts \emph{propagations}, which in SMT includes \emph{theory}
+propagation. On pure SAT unit propagation this is a good branching signal;
+whether it induces a good \emph{total order} under \textsc{DPLL(T)} is
+precisely the empirical question of Section~\ref{sec:results}.
+\end{remark}
+
+\subsection{Heterogeneous Graph Encoding}
+\label{sec:graph}
+
+A search state is encoded as a heterogeneous graph with six node types and
+seven directed edge types (Table~\ref{tab:nodes}). A theory atom
+$\sum_i c_i x_i \bowtie b$ is normalized to one side by decomposing both sides
+into linear forms $(\mathbf{c}^L,k^L)$ and $(\mathbf{c}^R,k^R)$ and setting
+\begin{equation}
+\begin{aligned}
+\mathbf{c} &= \mathbf{c}^L-\mathbf{c}^R \ (\text{drop zeros}),\quad
+b = k^R-k^L,\\
+\texttt{kind} &= \mathrm{map}(\bowtie).
+\end{aligned}
+\label{eq:linear}
+\end{equation}
+The atom shares a key with its abstracting Boolean variable, so an
+\textsc{atom-abstracted-by} edge links the theory-atom node to the Boolean
+node, and \textsc{variable-in-atom} edges are emitted from
+$\mathbf{c}$. Pure propositional constants carry no theory-atom or
+numeric-variable nodes, so a purely Boolean instance yields a purely Boolean
+graph. Optional scalars are encoded as $[x,1]$ if present and
+$[\text{default},0]$ if absent; large magnitudes pass through
+$\mathrm{slog}(x)=\operatorname{sign}(x)\log(1+|x|)$; tri-state Booleans use a
+one-hot $[\textit{none},\textit{true},\textit{false}]$.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}llp{3.9cm}@{}}
+\toprule
+Node type & Dim & Salient features \\
+\midrule
+\textsc{bool\_var}     & 19 & assignment, decision level, candidate flag, VSIDS/LRB/CHB activity, phase saving, polarity counts \\
+\textsc{clause}        & 11 & clause-type one-hot, LBD, activity, width, satisfied flag \\
+\textsc{theory\_atom}  & 22 & relation one-hot, $\mathrm{slog}(b)$, slack/violation/LP value, basis status, arity \\
+\textsc{numeric\_var}  & 17 & integrality, LP value/bounds, fractionality, objective coeff., reduced cost, pseudocost \\
+\textsc{objective}     & 10 & sense, incumbent/best-bound/gap, lex priority \\
+\textsc{search\_state} & 16 & depth, trail, restart/conflict counts, conflict rate, mode \\
+\bottomrule
+\end{tabular}
+\caption{Heterogeneous node types and feature dimensions. Edges are
+directed; message passing follows the directed schema (no reverse edges).}
+\label{tab:nodes}
+\end{table}
+
+\subsection{R-GCN-Style Encoder}
+\label{sec:gnn}
+
+We use a relational graph-convolution encoder \citep{schlichtkrull2018rgcn}
+with per-type input projection $h_v^{(0)}=\mathrm{Linear}_{t(v)}(x_v)$ and
+$L=3$ layers of hidden width $64$. For node $v$ of type $t(v)$,
+\begin{equation}
+h_v^{(l+1)}=\mathrm{LN}_{t(v)}\!\Bigl(h_v^{(l)}+\mathrm{ReLU}\bigl(
+W^{\mathrm{self}}_{t(v)} h_v^{(l)}
++ m_v^{(l)}\bigr)\Bigr),
+\label{eq:rgcn}
+\end{equation}
+\begin{equation}
+m_v^{(l)}=\meanop_{\,r,\;u\in\mathcal{N}_r(v)}
+W_r\,[\,h_u^{(l)}\,\Vert\,e_{u\to v}\,],
+\label{eq:msg}
+\end{equation}
+where $W_r$ is a per-edge-type linear map whose input concatenates the edge
+feature $e_{u\to v}$, messages over all relations $r$ into $v$ are summed and
+divided by the in-degree (floored at $1$), and the update applies a
+self-transform, a residual connection, and per-type layer normalization.
+
+\subsection{Task Heads and Imitation Loss}
+\label{sec:heads}
+
+From the encoded embeddings, a \textsc{BranchingHead} emits a scalar score
+$s_a$ per Boolean atom (the main head); a \textsc{PhaseHead} emits a
+``branch-true'' logit; an \textsc{IntegerBranchHead} emits a split score and
+direction for numeric variables; and \textsc{AuxiliaryHeads} predict
+conflict probability, unsat-core membership, objective improvement, and
+subtree size. All heads output raw scores; masking/softmax is applied
+downstream. The imitation loss is a weighted sum
+\begin{equation}
+L=L_{\mathrm{branch}}+\lambda_{\mathrm{ph}}L_{\mathrm{ph}}
++\lambda_{\mathrm{int}}(L_{\mathrm{int}}+L_{\mathrm{dir}})
++\lambda_{\mathrm{aux}}L_{\mathrm{aux}},
+\label{eq:imit}
+\end{equation}
+with $\lambda_{\mathrm{ph}}=0.5,\ \lambda_{\mathrm{int}}=1.0,\
+\lambda_{\mathrm{aux}}=0.3$. The ranking terms use a ListNet-style
+\citep{cao2007listnet} soft cross-entropy between the softmax of the teacher
+scores~\eqref{eq:teacher} and the softmax of the head scores,
+\begin{equation}
+L_{\mathrm{rank}}=-\!\!\sum_{a\in\text{cand}}\!\mathrm{softmax}(\text{tgt})_a\,
+\log\mathrm{softmax}(s)_a,
+\label{eq:listnet}
+\end{equation}
+optimized with Adam \citep{kingma2015adam}. Phase/direction use logit BCE;
+auxiliary heads use BCE (classification) and MSE (regression).
+
+\begin{remark}[Learnability guard]
+Whether $L_{\mathrm{branch}}$ decreases with training is a direct probe of
+whether the teacher labels are predictable from the features. On SMT(LIA),
+without the theory-atom structural encoding of Section~\ref{sec:graph} the
+branch gradient is frozen at the uniform floor $\log N$; adding the
+theory-atom features (Eq.~\ref{eq:linear}) restores a monotonically
+decreasing branch loss. Learnability, however, is not utility
+(Section~\ref{sec:results}).
+\end{remark}
+
+\subsection{REINFORCE Fine-Tuning}
+\label{sec:rl}
+
+A sampling oracle assigns a distribution over the action set
+$[\defer, a_1,\dots,a_m]$ ($m$ current undecided atoms):
+\begin{equation}
+\policy(\cdot\mid s)=\mathrm{softmax}\bigl([\,\ell_{\defer},s_{a_1},\dots,s_{a_m}\,]\bigr),
+\label{eq:rlpolicy}
+\end{equation}
+where $\ell_{\defer}$ is a shared learnable scalar occupying index $0$;
+sampling $\defer$ returns to VSIDS, otherwise the atom is chosen with phase
+forced true. The reward is log-compressed, $R=-\log(1+\confl)$ (SAT) or
+$-\log(1+\rlimit)$ (OMT), and a per-instance EMA baseline
+$b_{\mathrm{key}}\leftarrow0.9\,b_{\mathrm{key}}+0.1\,R$ yields a single
+trajectory-level advantage $A=R-b_{\mathrm{key}}$. The policy-gradient loss
+\citep{williams1992reinforce} is
+\begin{equation}
+L_{\mathrm{RL}}=-\frac{1}{n}\sum_{t=1}^{n}\log\policy(a_t\mid s_t)\,\bigl(R-b_{\mathrm{key}}\bigr),
+\label{eq:reinforce}
+\end{equation}
+with no per-step credit assignment and no discounting.
+
+% ==========================================================================
+\section{Experimental Setup}
+\label{sec:setup}
+% ==========================================================================
+
+\paragraph{Instances.}
+We use three generators. \emph{Hard random 3-SAT} is drawn at the
+phase-transition clause/variable ratio $\approx 4.26$ with $n=70$ variables.
+\emph{Pigeonhole (PHP)} gives structured \textsc{unsat} instances. \emph{Hard
+SMT(LIA)} is generated by \texttt{generate\_hard\_smt\_lia}: integer
+variables $x_i\in[0,\mathrm{ub}]$ under a conjunction of $k$-ary disjunctions
+of linear atoms,
+\begin{equation}
+\bigwedge_{j=1}^{\mathrm{n\_disj}}\ \bigvee_{l=1}^{k}
+\Bigl(\textstyle\sum_i c^{(j,l)}_i x_i\ \{\le\ \text{or}\ \ge\}\ b^{(j,l)}\Bigr),
+\label{eq:smtgen}
+\end{equation}
+with coefficients $c\in[-\mathrm{chi},\mathrm{chi}]$ and
+$b\in[-\mathrm{ub},\mathrm{ub}\cdot\mathrm{chi}]$, tightened so that Boolean
+search becomes the bottleneck (hundreds of conflicts under an attached
+propagator). Defaults: $\mathrm{n\_vars}{=}8$, $\mathrm{n\_disj}{=}30$,
+$k{=}3$, $\mathrm{ub}{=}6$, $\mathrm{chi}{=}4$.
+
+\paragraph{Protocol.}
+For each setting we (i) cold-start by imitation on look-ahead labels
+(Eq.~\ref{eq:listnet}), (ii) fine-tune by REINFORCE (Eq.~\ref{eq:reinforce}),
+and (iii) evaluate paired on held-out instances under
+Definition~\ref{def:pairing}, with \emph{train/test seeds disjoint} to
+preclude leakage. We report $\confl$ mean$\pm$std and the paired win-rate
+(fraction of instances on which the learned arm has fewer conflicts), and we
+include an \emph{untrained} control ($\text{train}{=}0$) to check that any
+gain is due to training rather than to the mere presence of a propagator.
+
+\paragraph{Implementation.}
+The policy is implemented in PyTorch; the solver is \emph{unmodified}
+\solver{}~4.15.4 installed from the \texttt{z3-solver} wheel (no
+recompilation). Behavior is governed by configuration dataclasses
+(\texttt{LookaheadConfig}, \texttt{TrainConfig}, \texttt{DecideRLConfig})
+rather than scattered flags. Hardware and wall-clock budgets: \blank{}
+(to be reported).
+
+% ==========================================================================
+\section{Results}
+\label{sec:results}
+% ==========================================================================
+
+Tables~\ref{tab:main}--\ref{tab:ablation} are scaffolded to the final
+protocol; result cells (\blank) are to be filled from clean final runs. We
+state the \emph{directional} findings, which are robust across our
+development runs, and defer magnitudes to the tables.
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabular}{@{}llcccccc@{}}
+\toprule
+Setting & Metric & VSIDS & Learned (trained) & Learned (untrained) & Paired win-rate & $\Delta\%$ & $\#$seeds \\
+\midrule
+Hard 3-SAT ($n{=}70$, $r{\approx}4.26$) & $\confl$ & \blank & \blank & \blank & \blank & \blank & \blank \\
+PHP (pigeonhole, \textsc{unsat})        & $\confl$ & \blank & \blank & \blank & \blank & \blank & \blank \\
+Hard SMT(LIA) ($8{\times}30$)           & $\confl$ & \blank & \blank & \blank & \blank & \blank & \blank \\
+OMT loop (linear search)                & $\rlimit$ & \blank & \blank & \blank & \blank & \blank & \blank \\
+\bottomrule
+\end{tabular}
+\caption{Main paired comparison (baseline VSIDS vs.\ learned oracle). Both
+SAT/SMT arms attach a propagator (Definition~\ref{def:pairing}); the OMT row
+uses the asymmetric harness of Section~\ref{sec:omt}. Lower is better.}
+\label{tab:main}
+\end{table*}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Domain & VSIDS & Teacher-oracle & GNN (trained) \\
+\midrule
+SAT (3-SAT $n{=}70$)  & \blank & \blank & \blank \\
+SMT(LIA)              & \blank & \blank & \blank \\
+\bottomrule
+\end{tabular}
+\caption{Root-cause probe: a \emph{teacher-oracle} arm branches by the
+look-ahead argmax (Eq.~\ref{eq:teacher}) with no GNN, isolating the teacher
+signal from the learned policy. $\confl$; lower is better.}
+\label{tab:oracle}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Configuration & Branch loss & $\confl$ vs.\ VSIDS \\
+\midrule
+w/o theory feats.\  & \blank\ (frozen) & \blank \\
+w/\ theory feats.\  & \blank\ (drops)  & \blank \\
+imitation only      & \blank & \blank \\
+imitation $+$ RL    & \blank & \blank \\
+\bottomrule
+\end{tabular}
+\caption{Ablations on SMT(LIA). Without the theory-atom encoding
+(Eq.~\ref{eq:linear}) the branch loss is frozen at the uniform floor
+$\approx\!\log N$; adding it makes the loss drop (learnability restored). RL
+fine-tuning is applied on top of the imitation cold start.}
+\label{tab:ablation}
+\end{table}
+
+\subsection{Positive: Hard Random 3-SAT}
+On hard 3-SAT the learned oracle reduces $\confl$ relative to VSIDS under the
+paired protocol (Table~\ref{tab:main}), with the trained policy clearly
+ahead of the untrained control. The root-cause probe
+(Table~\ref{tab:oracle}) shows the GNN beats \emph{both} VSIDS \emph{and} the
+teacher-oracle: the network does not merely imitate the look-ahead teacher
+but generalizes a smoother full-coverage order that outperforms it. This is
+the source of the SAT gain---not the teacher being strong.
+
+\subsection{Boundary: PHP / \textsc{unsat}}
+On pigeonhole \textsc{unsat} instances the learned arm does not help: the
+\texttt{consequences} look-ahead teacher provides no labels on top of a
+contradictory base (everything is entailed), so imitation has nothing to
+cold-start from and RL alone is insufficient. This is an honest limitation of
+a propagation-count teacher on \textsc{unsat}.
+
+\subsection{Boundary: SMT(LIA) Theory Atoms}
+The theory-atom encoding makes the imitation signal \emph{learnable}
+(Table~\ref{tab:ablation}: the branch loss unfreezes from the uniform floor),
+yet the learned oracle still loses to VSIDS (Table~\ref{tab:main}), with
+large variance across seeds. The probe (Table~\ref{tab:oracle}) localizes the
+cause: (i) it is \emph{not} teacher-mismatch---the teacher-oracle is
+$\approx$VSIDS on \emph{both} SAT and SMT; (ii) on SAT the GNN generalizes
+past the teacher, but on SMT it does not; (iii) the learned policy commits to
+a \emph{full-coverage, quasi-static} order (it almost never defers), and such
+an order cannot match VSIDS's per-conflict adaptation once decisions range
+over theory atoms. In short, a fixed learned order beats VSIDS on a
+purely propositional clause graph but is dominated by VSIDS dynamics on
+theory atoms.
+
+\subsection{Boundary: The OMT Loop}
+In the OMT linear-search loop the learned and baseline arms are
+indistinguishable in $\rlimit$. Three factors compound: (1) $\rlimit$ is
+dominated by the loop's theory-solving overhead, so branching is not the
+bottleneck and $-\rlimit$ carries little RL signal; (2) there is no
+conflict \emph{headroom}---even harder instances leave VSIDS with very few
+conflicts; and (3) \solver{} exposes only a hard \nextsplit{}, not a soft
+activity injection, so a learned \emph{full-coverage} order cannot be blended
+into VSIDS. The harness asymmetry of Section~\ref{sec:omt} further weakens any
+OMT claim, which we therefore report as inconclusive/negative rather than as
+a controlled comparison.
+
+% ==========================================================================
+\section{Discussion}
+\label{sec:discussion}
+% ==========================================================================
+
+The study yields a compact lesson: the benefit of learned Boolean branching
+factors as \emph{learnable structure} $\times$ \emph{a policy that
+generalizes past the dynamic baseline}. On hard SAT both factors hold; on
+SMT(LIA) the first holds (learnability is restored by the theory-atom
+encoding) but the second fails, because a quasi-static full-coverage order is
+dominated by VSIDS's conflict-adaptive dynamics; in the OMT loop branching is
+not the bottleneck at all. Two consequences follow. First, \emph{learnability
+is a necessary but not sufficient} diagnostic: a decreasing imitation loss
+does not imply a useful solver policy, and papers that report only the former
+may overstate their case. Second, the natural next design is
+\emph{selective deferral}---have the policy emit a confidence and override
+only high-confidence atoms while returning the rest to VSIDS (a soft blend
+into native activity)---which directly targets the SMT root cause. Further
+directions include an \textsc{unsat}-capable, conflict-driven teacher (to
+cover the PHP boundary), stronger theory-aware features (LP relaxation,
+theory-solver feedback), and larger training budgets, all evaluated on real
+solver traces by wall-clock and PAR-2.
+
+\paragraph{Threats to validity.}
+The OMT harness is asymmetric (Section~\ref{sec:omt}); SMT(LIA) variance is
+large, so magnitudes require many seeds even though the direction
+(learned $<$ VSIDS) is stable; and results are reported in $\confl$/$\rlimit$
+rather than wall-clock, which the mechanism's callback overhead would also
+affect. The measurement protocol (Definition~\ref{def:pairing}) is designed
+to keep the \emph{branching} comparison itself clean.
+
+% ==========================================================================
+\section{Conclusion}
+% ==========================================================================
+
+We turned a supported solver API into a formal object---a decision oracle
+over a black-box \textsc{CDCL(T)} procedure---that injects a learned
+branching policy into an unmodified \solver{} while provably preserving
+soundness and completeness, together with a measurement protocol that
+isolates branching quality. A graph-neural policy trained by a look-ahead
+teacher and REINFORCE improves on VSIDS on hard random 3-SAT but not on
+SMT(LIA) theory atoms or in the OMT loop, and we traced the boundary to the
+gap between a learned quasi-static order and VSIDS's conflict-adaptive
+dynamics. We hope the mechanism, the isolation protocol, and the honest
+boundary---learnability is not utility---are useful to others studying
+learned control of production SMT/OMT solvers.
+
+% ==========================================================================
+% 注:aaai2027.sty 已内置 \bibliographystyle{aaai2027},此处无需再声明。
+\bibliography{references}
+
+\end{document}

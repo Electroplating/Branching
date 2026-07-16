@@ -8,6 +8,7 @@ LearnedDecidePropagator 接管内部布尔决策。z3.Optimize 不支持 propaga
 from __future__ import annotations
 
 from fractions import Fraction
+import json
 import re
 import shutil
 import subprocess
@@ -197,6 +198,217 @@ def instance_to_smt2(inst: OMTInstance) -> str:
     lines.append("(check-sat)")
     lines.append(f"(get-value ({obj}))")
     return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# 读接口：SMT2 (+manifest) -> OMTInstance（与 instance_to_smt2 / save_dataset 互逆）
+# --------------------------------------------------------------------------- #
+
+_OBJ_RECOVER_VAR = "__omt_obj_recover__"
+
+
+def _read_smt2_source(source) -> tuple[str, Optional[str]]:
+    """把入参统一成 ``(smt2_text, derived_id)``。
+
+    ``source`` 是**已存在的文件路径**则读文件（``derived_id`` 取文件名）；否则当作
+    SMT-LIB2 文本（``derived_id`` 为 ``None``）。
+    """
+    try:
+        cand = Path(source)
+        if cand.exists() and cand.is_file():
+            return cand.read_text(encoding="utf-8"), cand.stem
+    except (OSError, ValueError):
+        pass
+    return str(source), None
+
+
+def _declared_var_names(text: str) -> list[str]:
+    """按声明顺序取所有 ``(declare-fun name () Int|Real)`` 的变量名。"""
+    return re.findall(r"^\(declare-fun\s+(\S+)\s*\(\)\s*(?:Int|Real)\)", text, re.M)
+
+
+def _extract_objective(text: str) -> tuple[Sense, str]:
+    """定位唯一的 ``(maximize|minimize <expr>)``，返回 ``(sense, expr_sexpr)``。
+
+    - 无目标 -> ``ValueError``；多目标 / ``assert-soft`` -> ``NotImplementedError``
+      （``OMTInstance`` 仅支持单目标）。
+    - ``<expr>`` 可跨多行，按括号配平提取。
+    """
+    hits = [(m.group(1), m.start())
+            for m in re.finditer(r"\((maximize|minimize)\b", text)]
+    if not hits:
+        raise ValueError("未找到 (maximize|minimize ...)：不是单目标 OMT 的 .smt2")
+    if len(hits) > 1 or "assert-soft" in text:
+        raise NotImplementedError(
+            "检测到多目标 / assert-soft：OMTInstance 仅支持单目标 OMT，暂不支持"
+        )
+    cmd, start = hits[0]
+    depth, end = 0, -1
+    for j in range(start, len(text)):
+        c = text[j]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                end = j + 1
+                break
+    if end == -1:
+        raise ValueError("(maximize|minimize ...) 括号不配平")
+    inner = text[start + 1 + len(cmd):end].strip()   # 去掉 "(cmd"
+    if inner.endswith(")"):
+        inner = inner[:-1].strip()                   # 去掉命令收尾 ")"
+    sense = Sense.MAX if cmd == "maximize" else Sense.MIN
+    return sense, inner
+
+
+def _parse_objective_expr(decl_lines: list[str], expr_sexpr: str, sort: str):
+    """在给定声明下把目标 S 表达式解析成 z3 ``ArithRef``。
+
+    z3 的 SMT-LIB 解析器会丢弃 OMT 的 maximize/minimize，故用一条等式
+    ``(= __obj__ <expr>)`` 让解析器重建目标表达式，再取等式的另一侧。
+    """
+    body = "\n".join(decl_lines)
+    smt2 = (
+        f"{body}\n(declare-fun {_OBJ_RECOVER_VAR} () {sort})\n"
+        f"(assert (= {_OBJ_RECOVER_VAR} {expr_sexpr}))\n"
+    )
+    eq = z3.parse_smt2_string(smt2)[0]
+    lhs, rhs = eq.arg(0), eq.arg(1)
+    if z3.is_const(lhs) and lhs.decl().name() == _OBJ_RECOVER_VAR:
+        return rhs
+    return lhs
+
+
+def _as_number(e) -> Optional[float]:
+    """把数值型 S 表达式（整数/有理/一元负号/除法）转 float，否则 None。"""
+    if z3.is_int_value(e):
+        return float(e.as_long())
+    if z3.is_rational_value(e):
+        return float(e.numerator_as_long()) / float(e.denominator_as_long())
+    if z3.is_app(e):
+        k = e.decl().kind()
+        if k == z3.Z3_OP_UMINUS and e.num_args() == 1:
+            n = _as_number(e.arg(0))
+            return None if n is None else -n
+        if k == z3.Z3_OP_DIV and e.num_args() == 2:
+            a, b = _as_number(e.arg(0)), _as_number(e.arg(1))
+            return a / b if (a is not None and b) else None
+    return None
+
+
+def _is_arith_var(e) -> bool:
+    return (z3.is_const(e)
+            and e.decl().kind() == z3.Z3_OP_UNINTERPRETED
+            and z3.is_arith(e))
+
+
+def _linear_terms(expr, var_names: list[str]) -> dict[str, float]:
+    """把线性目标分解为 ``{变量名: 系数}``（常数项丢弃）。
+
+    所有声明变量默认系数 0.0（与生成器约定一致），再据表达式累加；非线性节点尽力而为。
+    """
+    coeffs: dict[str, float] = {n: 0.0 for n in var_names}
+
+    def rec(e, scale: float) -> None:
+        if _as_number(e) is not None:
+            return                                   # 纯常数项，跳过
+        k = e.decl().kind() if z3.is_app(e) else None
+        if k == z3.Z3_OP_ADD:
+            for ch in e.children():
+                rec(ch, scale)
+            return
+        if k == z3.Z3_OP_SUB:
+            chs = e.children()
+            rec(chs[0], scale)
+            for ch in chs[1:]:
+                rec(ch, -scale)
+            return
+        if k == z3.Z3_OP_UMINUS:
+            rec(e.arg(0), -scale)
+            return
+        if k == z3.Z3_OP_MUL:
+            factor, var_children = 1.0, []
+            for ch in e.children():
+                num = _as_number(ch)
+                if num is None:
+                    var_children.append(ch)
+                else:
+                    factor *= num
+            if len(var_children) == 1 and _is_arith_var(var_children[0]):
+                nm = var_children[0].decl().name()
+                coeffs[nm] = coeffs.get(nm, 0.0) + scale * factor
+            else:
+                for ch in var_children:              # 非纯 c*x：尽力递归
+                    rec(ch, scale * factor)
+            return
+        if _is_arith_var(e):
+            nm = e.decl().name()
+            coeffs[nm] = coeffs.get(nm, 0.0) + scale
+            return
+        for ch in (e.children() if z3.is_app(e) else []):  # 未知结构：尽力而为
+            rec(ch, scale)
+
+    rec(expr, 1.0)
+    return coeffs
+
+
+def smt2_to_instance(source, *, instance_id: str | None = None,
+                     family: str = "imported", description: str = "") -> OMTInstance:
+    """把单目标 OMT 的 SMT-LIB2（``instance_to_smt2`` 的产物或等价文件）读回 ``OMTInstance``。
+
+    ``source``：已存在的 ``.smt2`` 文件路径，或直接的 SMT-LIB2 文本。硬约束与变量由 z3 解析；
+    目标/方向从唯一的 ``(maximize|minimize ...)`` 行恢复（z3 解析器不返回该命令，见
+    :func:`_parse_objective_expr`）；``obj_coeffs`` 由线性目标反推。多目标 / assert-soft 报错。
+    """
+    text, derived_id = _read_smt2_source(source)
+    hard = list(z3.parse_smt2_string(text))
+    sense, obj_sexpr = _extract_objective(text)
+    sort = "Real" if re.search(r"\(\)\s*Real\s*\)", text) else "Int"
+    theory = "LRA" if sort == "Real" else "LIA"
+    decl_lines = re.findall(r"^\(set-logic[^\n]*\)|^\(declare-fun[^\n]*\)", text, re.M)
+    objective = _parse_objective_expr(decl_lines, obj_sexpr, sort)
+    var_names = _declared_var_names(text)
+    variables = [z3.Int(n) if sort == "Int" else z3.Real(n) for n in var_names]
+    obj_coeffs = _linear_terms(objective, var_names)
+    return OMTInstance(
+        instance_id=instance_id or derived_id or "imported",
+        variables=variables, hard=hard, objective=objective, sense=sense,
+        obj_coeffs=obj_coeffs, theory=theory, family=family, description=description,
+    )
+
+
+def load_dataset(path, *, split: str | None = None) -> list[OMTInstance]:
+    """读回 ``save_dataset`` 落盘的数据集（``manifest.json`` + 各 ``.smt2``）。
+
+    ``path``：数据集目录或 ``manifest.json`` 路径。有 manifest 时按其 ``splits`` 枚举 ``.smt2``
+    文件；``split`` 可只取某一划分。无 manifest 时退化为「目录下每个 ``.smt2`` 各读一份」。
+
+    **权威来源是 ``.smt2`` 本身**：求解相关字段（``hard/objective/sense/variables/obj_coeffs/
+    theory``）一律自包含地从文件恢复——因为文件才是真正被求解的对象，manifest 可能过期/错位。
+    manifest 仅提供**标签**（``instance_id/family/description``，非文件内可推），best-effort 覆盖。
+    """
+    root = Path(path)
+    manifest_path = root if root.is_file() else root / "manifest.json"
+    if root.is_file():
+        root = root.parent
+
+    if not manifest_path.exists():
+        return [smt2_to_instance(f) for f in sorted(root.rglob("*.smt2"))]
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    splits = manifest.get("splits", {})
+    keys = [split] if split is not None else list(splits.keys())
+    out: list[OMTInstance] = []
+    for sp in keys:
+        for entry in splits.get(sp, []):
+            out.append(smt2_to_instance(
+                root / entry["smt2"],
+                instance_id=entry.get("instance_id"),
+                family=entry.get("family", "imported"),
+                description=entry.get("description", ""),
+            ))
+    return out
 
 
 def _parse_smt_num(token: str) -> Optional[Fraction]:

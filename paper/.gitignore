@@ -1,0 +1,6 @@
+# paper/ —— 只跟踪论文源码(.tex / .bib),其余全部忽略
+# (AuthorKit27/ 内 ~5MB PDF、复制来的 aaai2027.sty/.bst、LaTeX 编译产物、main.pdf 等一律不入库)
+*
+!.gitignore
+!main.tex
+!references.bib
