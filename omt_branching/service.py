@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from omt_branching.input.graph_builder import DEFAULT_FEATURE_SPEC, FeatureSpec, GraphBuilder
 from omt_branching.input.solver_state import SolverSnapshot
@@ -18,18 +18,21 @@ from omt_branching.output.decoder import AdviceDecoder, DecoderConfig
 
 @dataclass
 class ServiceConfig:
-    policy: PolicyConfig = PolicyConfig()
-    inference: InferenceConfig = InferenceConfig()
-    decoder: DecoderConfig = DecoderConfig()
+    policy: PolicyConfig = field(default_factory=PolicyConfig)
+    inference: InferenceConfig = field(default_factory=InferenceConfig)
+    decoder: DecoderConfig = field(default_factory=DecoderConfig)
 
 
 class BranchingPolicyService:
     """输入 -> 模型推理 -> 输出 的端到端封装。"""
 
-    def __init__(self, policy: BranchingPolicy | None = None,
-                 feature_spec: FeatureSpec = DEFAULT_FEATURE_SPEC,
-                 config: ServiceConfig = ServiceConfig()):
-        self.config = config
+    def __init__(
+        self,
+        policy: BranchingPolicy | None = None,
+        feature_spec: FeatureSpec = DEFAULT_FEATURE_SPEC,
+        config: ServiceConfig | None = None,
+    ):
+        config = config or ServiceConfig()
         self.builder = GraphBuilder(feature_spec)
         self.policy = policy or BranchingPolicy(feature_spec, config.policy)
         self.engine = InferenceEngine(self.policy, config.inference)
