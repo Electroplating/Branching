@@ -44,6 +44,8 @@ from omt_branching.solver import (
     solve_omt_with_decider,
 )
 from omt_branching.solver.binary_results import (
+    binary_rlimit,
+    binary_value,
     load_binary_result,
     missing_binary_ids,
 )
@@ -363,7 +365,7 @@ def main() -> None:
         ids = [e["instance_id"] for e in train_entries]
         print(
             f"look-ahead 标签构建: {len(paths)} 实例(from smt2), "
-            f"workers={lookahead_workers}"
+            f"workers={lookahead_workers}（优先读 lookahead/ 缓存）"
         )
         exs = [
             e
@@ -371,6 +373,9 @@ def main() -> None:
                 paths,
                 instance_ids=ids,
                 workers=lookahead_workers,
+                dataset_dir=args.dataset_dir,
+                split="train",
+                use_cache=True,
             )
             if e.bool_target_scores
         ]
@@ -387,9 +392,24 @@ def main() -> None:
             train_insts = load_dataset(args.dataset_dir, split="train")
         if not train_entries:
             train_entries = list_split_entries(args.dataset_dir, "train")
+        missing = missing_binary_ids(args.dataset_dir, train_entries, split="train")
+        if missing:
+            preview = ", ".join(missing[:5])
+            more = f" 等共 {len(missing)} 个" if len(missing) > 5 else ""
+            raise SystemExit(
+                f"RL 需要 train 划分的 binary 缓存（缺 {preview}{more}）。\n"
+                f"请先运行: python -m examples.solve_dataset_binary "
+                f"--dataset-dir {args.dataset_dir} --split train"
+            )
         rl_train = train_insts
         rl_paths = _smt2_abs_paths(args.dataset_dir, train_entries)
         rl_ids = [e["instance_id"] for e in train_entries]
+        rl_ref_values = [
+            binary_value(args.dataset_dir, iid, split="train") for iid in rl_ids
+        ]
+        rl_ref_rlimits = [
+            binary_rlimit(args.dataset_dir, iid, split="train") for iid in rl_ids
+        ]
 
         rl_workers = effective_rl_workers(len(rl_train), args.rl_workers)
         rlt = DecideRLTrainer(
@@ -403,7 +423,8 @@ def main() -> None:
         mode = f"并行×{rl_workers}" if rl_workers > 1 else "串行(GPU collect)"
         print(
             f"RL collect: {len(rl_train)} 实例 × {args.rl_iters} 轮, {mode} "
-            f"(请求 workers={args.rl_workers})；collect 用 CPU，update 用 {device}"
+            f"(请求 workers={args.rl_workers})；collect 用 CPU，update 用 {device}；"
+            f"reward 使用 binary ref_value/ref_rlimit"
         )
         print(f"RL checkpoints -> {args.ckpt_dir}/ (every {args.ckpt_every})")
         h = rlt.train(
@@ -417,6 +438,8 @@ def main() -> None:
             collect_max_vars=args.max_vars,
             smt2_paths=rl_paths,
             instance_ids=rl_ids,
+            ref_values=rl_ref_values,
+            ref_rlimits=rl_ref_rlimits,
             checkpoint_dir=args.ckpt_dir,
             checkpoint_every=args.ckpt_every,
         )

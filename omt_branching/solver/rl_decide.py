@@ -33,6 +33,25 @@ def _policy_state_cpu(policy: BranchingPolicy) -> dict:
     return {k: v.detach().cpu() for k, v in policy.state_dict().items()}
 
 
+def decide_rl_reward(res: dict) -> float:
+    """由 ``solve_omt_with_decider`` 返回值计算 REINFORCE 奖励。
+
+    有 ``ref_rlimit``（binary 参考）时用相对代价 ``-log1p(ours) + log1p(ref)``，
+    使优于 binary 的求解得到正优势；否则退化为 ``-log1p(weighted rlimit)``。
+    若同时有 ``ref_value`` 且与本次 ``value`` 不一致，额外施加 match 惩罚。
+    """
+    ours = float(res.get("weighted rlimit") or res.get("rlimit") or 0)
+    ref_rl = res.get("ref_rlimit")
+    if ref_rl is not None and float(ref_rl) > 0:
+        reward = -math.log1p(ours) + math.log1p(float(ref_rl))
+    else:
+        reward = -math.log1p(ours)
+    ref_val = res.get("ref_value")
+    if ref_val is not None and res.get("value") is not None and res["value"] != ref_val:
+        reward -= 1.0
+    return reward
+
+
 def effective_rl_workers(
     count: int,
     requested: int,
@@ -139,6 +158,8 @@ def _rl_collect_worker(task: tuple) -> tuple:
         device,
         smt2_path,
         instance_id,
+        ref_value,
+        ref_rlimit,
     ) = task
     if smt2_path:
         from omt_branching.solver.decide_omt import smt2_to_instance
@@ -178,9 +199,11 @@ def _rl_collect_worker(task: tuple) -> tuple:
         sense,
         decider_factory=factory,
         max_iters=max_iters,
+        ref_value=ref_value,
+        ref_rlimit=ref_rlimit,
     )
     steps = holder["d"].steps if "d" in holder else []
-    reward = -math.log1p(res["weighted rlimit"])
+    reward = decide_rl_reward(res)
     return inst_idx, _steps_to_cpu(steps), reward, res
 
 
@@ -205,7 +228,15 @@ class DecideRLTrainer:
         else:
             self._baselines[key] = value
 
-    def collect(self, hard, objective, sense: Sense):
+    def collect(
+        self,
+        hard,
+        objective,
+        sense: Sense,
+        *,
+        ref_value=None,
+        ref_rlimit: int | None = None,
+    ):
         holder: dict = {}
 
         def factory(assertions):
@@ -226,9 +257,11 @@ class DecideRLTrainer:
             sense,
             decider_factory=factory,
             max_iters=self.config.max_iters,
+            ref_value=ref_value,
+            ref_rlimit=ref_rlimit,
         )
         steps = holder["d"].steps if "d" in holder else []
-        reward = -math.log1p(res["weighted rlimit"])
+        reward = decide_rl_reward(res)
         return steps, reward, res
 
     def _collect_parallel(
@@ -244,6 +277,8 @@ class DecideRLTrainer:
         iter_idx: int = 0,
         smt2_paths: list[str] | None = None,
         instance_ids: list[str] | None = None,
+        ref_values: list | None = None,
+        ref_rlimits: list[int | None] | None = None,
     ) -> list[tuple[int, list, float, dict]]:
         """多进程 collect；worker 固定 CPU，主进程 update 阶段再用 GPU。"""
         policy_state = _policy_state_cpu(self.policy)
@@ -251,8 +286,10 @@ class DecideRLTrainer:
         worker_device = "cpu"
         paths = smt2_paths or [None] * count
         ids = instance_ids or [None] * count
-        if len(paths) != count or len(ids) != count:
-            raise ValueError("smt2_paths / instance_ids 长度必须等于实例数")
+        vals = ref_values if ref_values is not None else [None] * count
+        rls = ref_rlimits if ref_rlimits is not None else [None] * count
+        if not (len(paths) == len(ids) == len(vals) == len(rls) == count):
+            raise ValueError("smt2_paths / instance_ids / ref_* 长度必须等于实例数")
         tasks = [
             (
                 j,
@@ -267,6 +304,8 @@ class DecideRLTrainer:
                 worker_device,
                 paths[j],
                 ids[j],
+                vals[j],
+                rls[j],
             )
             for j in range(count)
         ]
@@ -375,13 +414,17 @@ class DecideRLTrainer:
         collect_max_vars: int = 7,
         smt2_paths: list[str] | None = None,
         instance_ids: list[str] | None = None,
+        ref_values: list | None = None,
+        ref_rlimits: list[int | None] | None = None,
         checkpoint_dir: str | None = None,
         checkpoint_every: int = 1,
     ):
         """REINFORCE 训练。``workers>1`` 且实例数足够时用 spawn 进程池并行 collect。
 
         ``smt2_paths`` 非空时 worker 从落盘文件读实例（与已有 dataset 对齐），否则按
-        seed 重建。``checkpoint_dir`` 非空时每隔 ``checkpoint_every`` 轮保存中间权重。
+        seed 重建。``ref_values`` / ``ref_rlimits`` 为各实例的 binary 参考（传入
+        ``solve_omt_with_decider`` 供 reward）。``checkpoint_dir`` 非空时每隔
+        ``checkpoint_every`` 轮保存中间权重。
         """
         instances = list(instances)
         count = len(instances)
@@ -389,6 +432,12 @@ class DecideRLTrainer:
             raise ValueError("smt2_paths 长度必须等于 instances")
         if instance_ids is not None and len(instance_ids) != count:
             raise ValueError("instance_ids 长度必须等于 instances")
+        if ref_values is not None and len(ref_values) != count:
+            raise ValueError("ref_values 长度必须等于 instances")
+        if ref_rlimits is not None and len(ref_rlimits) != count:
+            raise ValueError("ref_rlimits 长度必须等于 instances")
+        vals = ref_values if ref_values is not None else [None] * count
+        rls = ref_rlimits if ref_rlimits is not None else [None] * count
         requested = workers if workers is not None else self.config.workers
         n_workers = effective_rl_workers(
             count,
@@ -396,7 +445,6 @@ class DecideRLTrainer:
             min_instances=self.config.min_instances_for_parallel,
         )
         use_parallel = n_workers > 1
-        # 有 smt2 路径时并行可走路径；无路径时仍用 seed 重建
         history = []
         pool: ProcessPoolExecutor | None = None
         if use_parallel:
@@ -419,6 +467,8 @@ class DecideRLTrainer:
                             iter_idx=it,
                             smt2_paths=smt2_paths,
                             instance_ids=instance_ids,
+                            ref_values=vals,
+                            ref_rlimits=rls,
                         )
                         for upd_i, (j, steps, reward, res) in enumerate(batch):
                             stats = self.update(steps, reward, key=j)
@@ -427,6 +477,11 @@ class DecideRLTrainer:
                                 "instance": j,
                                 "rlimit": res["rlimit"],
                                 "conflicts": res["conflicts"],
+                                "ref_rlimit": res.get("ref_rlimit"),
+                                "match": (
+                                    res.get("ref_value") is None
+                                    or res.get("value") == res.get("ref_value")
+                                ),
                             })
                             history.append(stats)
                             if log:
@@ -442,13 +497,24 @@ class DecideRLTrainer:
                             )
                     else:
                         for j, (hard, obj, sense) in enumerate(instances):
-                            steps, reward, res = self.collect(hard, obj, sense)
+                            steps, reward, res = self.collect(
+                                hard,
+                                obj,
+                                sense,
+                                ref_value=vals[j],
+                                ref_rlimit=rls[j],
+                            )
                             stats = self.update(steps, reward, key=j)
                             stats.update({
                                 "iter": it,
                                 "instance": j,
                                 "rlimit": res["rlimit"],
                                 "conflicts": res["conflicts"],
+                                "ref_rlimit": res.get("ref_rlimit"),
+                                "match": (
+                                    res.get("ref_value") is None
+                                    or res.get("value") == res.get("ref_value")
+                                ),
                             })
                             history.append(stats)
                             if log:
@@ -480,6 +546,7 @@ __all__ = [
     "DEFAULT_RL_COLLECT_WORKERS",
     "MIN_INSTANCES_FOR_RL_PARALLEL",
     "effective_rl_workers",
+    "decide_rl_reward",
     "SamplingPolicyDecider",
     "DecideRLConfig",
     "DecideRLTrainer",

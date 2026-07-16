@@ -187,16 +187,25 @@ DEFAULT_LOOKAHEAD_WORKERS = 12
 
 
 def _build_lookahead_one(
-    inst: OMTInstance, config
+    inst: OMTInstance,
+    config,
+    *,
+    scores_phases: tuple[dict, dict] | None = None,
 ) -> RankingExample | None:
-    """单实例 look-ahead 标签；无有效 bool 候选时返回 None。"""
+    """单实例 look-ahead 标签；无有效 bool 候选时返回 None。
+
+    ``scores_phases`` 若给定则跳过 z3 look-ahead（用缓存的 atom_key 分数/相位）。
+    """
     from omt_branching.solver.lookahead import lookahead_scores
     from omt_branching.solver.propagator_snapshot import build_bool_snapshot
 
     hard = list(inst.hard)
     snap, amap = build_bool_snapshot(hard)
     graph = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
-    scores, phases = lookahead_scores(hard, atoms=list(amap.values()), config=config)
+    if scores_phases is not None:
+        scores, phases = scores_phases
+    else:
+        scores, phases = lookahead_scores(hard, atoms=list(amap.values()), config=config)
     bmap = graph.id_maps.get(NodeType.BOOL_VAR, {})
     bts: dict[int, float] = {}
     pts: dict[int, bool] = {}
@@ -213,6 +222,52 @@ def _build_lookahead_one(
     return RankingExample(graph=graph, bool_target_scores=bts, phase_targets=pts)
 
 
+def _compute_and_maybe_cache_lookahead(
+    inst: OMTInstance,
+    cfg,
+    *,
+    dataset_dir: str | None = None,
+    split: str | None = None,
+    use_cache: bool = True,
+) -> RankingExample | None:
+    """算 look-ahead；有 dataset_dir/split 时读/写持久化缓存。"""
+    from omt_branching.solver.lookahead import lookahead_scores
+    from omt_branching.solver.lookahead_cache import (
+        load_lookahead_result,
+        save_lookahead_result,
+    )
+    from omt_branching.solver.propagator_snapshot import build_bool_snapshot
+
+    cached = None
+    if use_cache and dataset_dir and split and inst.instance_id:
+        cached = load_lookahead_result(
+            dataset_dir,
+            inst.instance_id,
+            split=split,
+            max_atoms=cfg.max_atoms,
+            eps=cfg.eps,
+        )
+    if cached is not None:
+        return _build_lookahead_one(
+            inst, cfg, scores_phases=(cached["scores"], cached["phases"])
+        )
+
+    hard = list(inst.hard)
+    snap, amap = build_bool_snapshot(hard)
+    scores, phases = lookahead_scores(hard, atoms=list(amap.values()), config=cfg)
+    if use_cache and dataset_dir and split and inst.instance_id and scores:
+        save_lookahead_result(
+            dataset_dir,
+            inst.instance_id,
+            split=split,
+            scores=scores,
+            phases=phases,
+            max_atoms=cfg.max_atoms,
+            eps=cfg.eps,
+        )
+    return _build_lookahead_one(inst, cfg, scores_phases=(scores, phases))
+
+
 def _lookahead_example_worker(task: tuple) -> tuple[int, RankingExample | None]:
     """ProcessPool worker：按 index/seed 重建实例并构造 look-ahead 样本。"""
     index, seed, hard, min_vars, max_vars, max_atoms, eps = task
@@ -227,14 +282,29 @@ def _lookahead_example_worker(task: tuple) -> tuple[int, RankingExample | None]:
 
 
 def _lookahead_from_smt2_worker(task: tuple) -> tuple[int, RankingExample | None]:
-    """ProcessPool worker：从已落盘 ``.smt2`` 读实例并构造 look-ahead 样本。"""
-    index, smt2_path, instance_id, max_atoms, eps = task
+    """ProcessPool worker：从已落盘 ``.smt2`` 读实例；优先用 look-ahead 缓存。"""
+    (
+        index,
+        smt2_path,
+        instance_id,
+        max_atoms,
+        eps,
+        dataset_dir,
+        split,
+        use_cache,
+    ) = task
     from omt_branching.solver.decide_omt import smt2_to_instance
     from omt_branching.solver.lookahead import LookaheadConfig
 
     inst = smt2_to_instance(smt2_path, instance_id=instance_id)
     cfg = LookaheadConfig(max_atoms=max_atoms, eps=eps)
-    return index, _build_lookahead_one(inst, cfg)
+    return index, _compute_and_maybe_cache_lookahead(
+        inst,
+        cfg,
+        dataset_dir=dataset_dir,
+        split=split,
+        use_cache=use_cache,
+    )
 
 
 def build_lookahead_examples(instances, config=None):
@@ -306,8 +376,15 @@ def build_lookahead_examples_from_smt2_parallel(
     instance_ids: list[str] | None = None,
     config=None,
     workers: int = DEFAULT_LOOKAHEAD_WORKERS,
+    dataset_dir: str | None = None,
+    split: str | None = None,
+    use_cache: bool = True,
 ) -> list[RankingExample]:
-    """从已落盘 ``.smt2`` 并行构造 look-ahead 样本（不重新生成实例）。"""
+    """从已落盘 ``.smt2`` 并行构造 look-ahead 样本（不重新生成实例）。
+
+    ``dataset_dir`` + ``split`` 非空且 ``use_cache`` 时：优先读
+    ``lookahead/<split>/<id>.json``；缺失则计算后即时写入。
+    """
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     from omt_branching.solver.lookahead import LookaheadConfig
@@ -324,7 +401,13 @@ def build_lookahead_examples_from_smt2_parallel(
         out: list[RankingExample] = []
         for path, iid in zip(smt2_paths, ids):
             inst = smt2_to_instance(path, instance_id=iid)
-            ex = _build_lookahead_one(inst, cfg)
+            ex = _compute_and_maybe_cache_lookahead(
+                inst,
+                cfg,
+                dataset_dir=dataset_dir,
+                split=split,
+                use_cache=use_cache,
+            )
             if ex is not None:
                 out.append(ex)
         return out
@@ -333,7 +416,17 @@ def build_lookahead_examples_from_smt2_parallel(
     workers = min(workers, n)
     max_atoms, eps = cfg.max_atoms, cfg.eps
     tasks = [
-        (i, smt2_paths[i], ids[i], max_atoms, eps) for i in range(n)
+        (
+            i,
+            smt2_paths[i],
+            ids[i],
+            max_atoms,
+            eps,
+            dataset_dir,
+            split,
+            use_cache,
+        )
+        for i in range(n)
     ]
     slots: list[RankingExample | None] = [None] * n
     with ProcessPoolExecutor(max_workers=workers) as pool:

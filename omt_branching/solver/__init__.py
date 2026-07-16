@@ -52,6 +52,9 @@ from omt_branching.solver.binary_results import (
     binary_rlimit, binary_value, has_binary_result, load_binary_result,
     load_binary_results, missing_binary_ids, save_binary_result,
 )
+from omt_branching.solver.lookahead_cache import (
+    has_lookahead_result, load_lookahead_result, save_lookahead_result,
+)
 from omt_branching.solver.sat_instances import generate_php, generate_rand_3sat, generate_hard_smt_lia
 from omt_branching.solver.sat_solve import solve_sat_with_decider
 from omt_branching.solver.strong_branch import (
@@ -142,6 +145,9 @@ __all__ = [
     "load_binary_results",
     "missing_binary_ids",
     "save_binary_result",
+    "has_lookahead_result",
+    "load_lookahead_result",
+    "save_lookahead_result",
     "generate_php",
     "generate_rand_3sat",
     "generate_hard_smt_lia",

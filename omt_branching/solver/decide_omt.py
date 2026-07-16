@@ -48,8 +48,15 @@ def solve_omt_with_decider(
     decider_factory=None,
     max_iters: int = 100000,
     ctx: z3.Context | None = None,
+    *,
+    ref_value=None,
+    ref_rlimit: int | None = None,
 ) -> dict:
-    """OMT 线性搜索；默认在独立 :class:`z3.Context` 内运行，避免跨线程/跨求解共享表达式。"""
+    """OMT 线性搜索；默认在独立 :class:`z3.Context` 内运行，避免跨线程/跨求解共享表达式。
+
+    ``ref_value`` / ``ref_rlimit``：可选的 z3 binary 参考最优值与 rlimit（来自数据集缓存），
+    原样写入返回字典，供 RL reward / match 计算使用；不参与搜索过程本身。
+    """
     if ctx is None:
         ctx = z3.Context()
     hard_iso = [h.translate(ctx) for h in hard]
@@ -134,6 +141,8 @@ def solve_omt_with_decider(
     stats["model cut rlimit"] = sum(model_rlimit) - model_rlimit[0]
     stats["check rlimit"] = sum(check_rlimit)
     stats["eval rlimit"] = sum(eval_rlimit)
+    stats["ref_value"] = ref_value
+    stats["ref_rlimit"] = ref_rlimit
 
     return stats
 
