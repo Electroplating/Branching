@@ -1,8 +1,10 @@
 """Decide 层 RL：采样式 decider（含 defer-to-VSIDS 动作）+ REINFORCE 训练器。
 
-每个 decide 对 ``[defer_logit, 未定原子 bool 分数]`` softmax 采样：采到 defer -> return None
-(退回 VSIDS)，否则覆盖采样原子。记录 (refocus 图, 未定局部索引, 采样索引) 供 REINFORCE 重算
-log-prob。奖励 = −log1p(rlimit)，per-instance EMA baseline。
+**窗口粘性**（``sticky_window=True``，训练默认）：每个 ``refocus_every`` 窗口只跑一次
+GNN，对 ``[defer, 当时未定原子]`` 采样一次并记一条 REINFORCE step；窗口内后续 decide
+不再采样/进 torch——defer 则整窗放行 VSIDS，否则粘性返回采样原子，已定后按缓存分数贪心。
+
+``sticky_window=False`` 恢复旧行为（每次 decide 都采样并记 step）。
 """
 
 from __future__ import annotations
@@ -79,6 +81,8 @@ class SamplingPolicyDecider:
         refocus_every: int = 50,
         sample: bool = True,
         device: str | torch.device = "cpu",
+        *,
+        sticky_window: bool = True,
     ):
         self.policy = policy
         self.defer_logit = defer_logit  # torch 标量（trainer 持有的可学参数）
@@ -86,35 +90,125 @@ class SamplingPolicyDecider:
         self.assertions = list(assertions)
         self.refocus_every = max(1, refocus_every)
         self.sample = sample
+        # True：每窗只采样/记 step 一次，其后按缓存分数立即返回（训练默认）
+        self.sticky_window = sticky_window
         self._graph = None
-        self._scores = None  # detached bool_branch_scores（CPU 采样）
+        self._scores = None  # detached bool_branch_scores（CPU）
+        self._phases = None  # detached phase_logits（CPU），>0 → True
         self._bmap: dict = {}
+        self._score_by_key: dict[str, float] = {}
+        self._phase_by_key: dict[str, bool] = {}
+        self._window_defer: bool = False
+        self._window_choice: Optional[str] = None
+        self._window_phase: bool = True
         self._since = self.refocus_every
         self.steps: list = []
 
-    def _refocus(self, assignment):
+    def _undecided_pairs(self, undecided_keys):
+        if self._scores is None or self._scores.numel() == 0:
+            return [], []
+        keys, locs = [], []
+        n = self._scores.numel()
+        for k in undecided_keys:
+            loc = self._bmap.get(k)
+            if loc is not None and loc < n:
+                keys.append(k)
+                locs.append(loc)
+        return keys, locs
+
+    def _rebuild_key_tables(self) -> None:
+        """从当前 ``_scores``/``_phases``/``_bmap`` 建 key→分数表（供窗口内贪心）。"""
+        self._score_by_key = {}
+        self._phase_by_key = {}
+        if self._scores is None:
+            return
+        score_list = self._scores.tolist()
+        phase_list = self._phases.tolist() if self._phases is not None else None
+        n = len(score_list)
+        for k, loc in self._bmap.items():
+            if loc < n:
+                self._score_by_key[k] = score_list[loc]
+                if phase_list is not None and loc < len(phase_list):
+                    self._phase_by_key[k] = phase_list[loc] > 0
+                else:
+                    self._phase_by_key[k] = True
+
+    def _greedy_from_cache(self, undecided_keys) -> Optional[tuple]:
+        """窗口内快路径：无 torch，按缓存 GNN 分数取最高未定原子。"""
+        best_k = None
+        best_s = float("-inf")
+        for k in undecided_keys:
+            s = self._score_by_key.get(k)
+            if s is not None and s > best_s:
+                best_s = s
+                best_k = k
+        if best_k is None:
+            return None
+        return best_k, self._phase_by_key.get(best_k, True)
+
+    def _sample_window_action(self, undecided_keys) -> Optional[tuple]:
+        """在当前缓存分数上采样/argmax 一次，写入 window 状态并 ``steps.append``。"""
+        keys, locs = self._undecided_pairs(undecided_keys)
+        self._window_defer = False
+        self._window_choice = None
+        self._window_phase = True
+        if not keys or self._graph is None:
+            self._window_defer = True
+            return None
+        defer = self.defer_logit.detach().cpu().reshape(1)
+        logits = torch.cat([defer, self._scores[locs]])
+        if self.sample:
+            idx = int(torch.multinomial(torch.softmax(logits, dim=0), 1).item())
+        else:
+            idx = int(torch.argmax(logits).item())
+        self.steps.append((self._graph, locs, idx))
+        if idx == 0:
+            self._window_defer = True
+            return None
+        key = keys[idx - 1]
+        phase = self._phase_by_key.get(key, True)
+        self._window_choice = key
+        self._window_phase = phase
+        return key, phase
+
+    def _refocus(self, assignment) -> None:
         snap, _ = build_bool_snapshot(self.assertions, assignment=assignment)
         g = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
         g = g.to(self.device)
         out = self.policy.infer(g)
         self._graph = g
-        # z3 回调内用 CPU 分数采样，避免 GPU .item() 同步
+        # z3 回调内用 CPU 分数，避免 GPU .item() 同步
         self._scores = out.bool_branch_scores.detach().cpu()
+        self._phases = out.phase_logits.detach().cpu()
         self._bmap = g.id_maps.get(NodeType.BOOL_VAR, {})
+        self._rebuild_key_tables()
 
     def __call__(self, undecided_keys, assignment) -> Optional[tuple]:
         if self._since >= self.refocus_every:
             self._refocus(assignment)
             self._since = 0
+            if self.sticky_window:
+                # 本窗唯一一次采样 / 记 step；返回值即本次回调结果
+                self._since += 1
+                return self._sample_window_action(undecided_keys)
         self._since += 1
+
         if self._graph is None or self._scores is None or self._scores.numel() == 0:
             return None
-        pairs = [(k, self._bmap.get(k)) for k in undecided_keys]
-        pairs = [(k, l) for k, l in pairs if l is not None and l < self._scores.numel()]
-        if not pairs:
+
+        if self.sticky_window:
+            if self._window_defer:
+                return None
+            # 粘性原子仍未定：直接返回（无采样）
+            if self._window_choice is not None and self._window_choice in undecided_keys:
+                return self._window_choice, self._window_phase
+            # 粘性原子已定：按缓存分数贪心覆盖其余未定
+            return self._greedy_from_cache(undecided_keys)
+
+        # 旧行为：每次 decide 都采样并记 step（消融 / 对比用）
+        keys, locs = self._undecided_pairs(undecided_keys)
+        if not keys:
             return None
-        keys = [k for k, _ in pairs]
-        locs = [l for _, l in pairs]
         defer = self.defer_logit.detach().cpu().reshape(1)
         logits = torch.cat([defer, self._scores[locs]])
         probs = torch.softmax(logits, dim=0)
@@ -125,8 +219,8 @@ class SamplingPolicyDecider:
         )
         self.steps.append((self._graph, locs, idx))
         if idx == 0:
-            return None  # defer -> VSIDS
-        return keys[idx - 1], True  # 覆盖采样原子（相位取真）
+            return None
+        return keys[idx - 1], self._phase_by_key.get(keys[idx - 1], True)
 
 
 @dataclass

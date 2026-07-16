@@ -20,9 +20,45 @@ def test_sampling_decider_records_steps_and_valid_choice():
     outs = [dec(und, {}) for _ in range(5)]
     # 每次返回 None(defer) 或 合法未定原子+bool
     assert all(o is None or (o[0] in und and isinstance(o[1], bool)) for o in outs)
-    assert len(dec.steps) == 5            # 记录了 5 步
+    # sticky_window：整窗只采样/记 step 一次
+    assert len(dec.steps) == 1
     g, ls, idx = dec.steps[0]
     assert 0 <= idx <= len(ls)            # idx=0=defer, 1..len=原子
+
+
+def test_sampling_decider_sticky_reuses_scores_without_resample():
+    """窗口内后续回调不再增加 steps，且在粘性原子仍未定时重复返回同一选择。"""
+    x = z3.Int("x")
+    a, b = x >= 5, x <= 2
+    asserts = [x >= 0, x <= 10, z3.Or(a, b)]
+    policy = BranchingPolicy()
+    defer = torch.tensor(-10.0)  # 极低 defer → 几乎必采原子
+    dec = SamplingPolicyDecider(
+        policy, defer, asserts, refocus_every=10, sample=True, sticky_window=True
+    )
+    und = [atom_key(a), atom_key(b)]
+    torch.manual_seed(1)
+    o1 = dec(und, {})
+    o2 = dec(und, {})
+    o3 = dec(und, {})
+    assert len(dec.steps) == 1
+    assert o1 is not None and o1[0] in und
+    assert o2 == o1 and o3 == o1
+
+
+def test_sampling_decider_nonsticky_records_every_call():
+    x = z3.Int("x")
+    a, b = x >= 5, x <= 2
+    asserts = [x >= 0, x <= 10, z3.Or(a, b)]
+    policy = BranchingPolicy()
+    defer = torch.zeros(())
+    dec = SamplingPolicyDecider(
+        policy, defer, asserts, refocus_every=100, sample=True, sticky_window=False
+    )
+    und = [atom_key(a), atom_key(b)]
+    torch.manual_seed(0)
+    _ = [dec(und, {}) for _ in range(5)]
+    assert len(dec.steps) == 5
 
 
 def test_decide_rl_collect_update_runs():
