@@ -42,7 +42,10 @@ from omt_branching.solver.propagator_snapshot import (
 )
 from omt_branching.solver.propagator import LearnedDecidePropagator
 from omt_branching.solver.policy_decider import PolicyDecider
-from omt_branching.solver.decide_omt import instance_to_smt2, solve_binary, solve_omt_with_decider, solve_native
+from omt_branching.solver.decide_omt import (
+    instance_to_smt2, load_dataset, smt2_to_instance,
+    solve_binary, solve_omt_with_decider, solve_native,
+)
 from omt_branching.solver.sat_instances import generate_php, generate_rand_3sat, generate_hard_smt_lia
 from omt_branching.solver.sat_solve import solve_sat_with_decider
 from omt_branching.solver.strong_branch import (
@@ -116,6 +119,8 @@ __all__ = [
     "LearnedDecidePropagator",
     "PolicyDecider",
     "instance_to_smt2",
+    "smt2_to_instance",
+    "load_dataset",
     "solve_omt_with_decider",
     "solve_native",
     "solve_binary",

@@ -1,3 +1,4 @@
 torch>=2.0
 numpy>=1.21
 z3-solver>=4.15.4,<4.16
+tqdm>=4.60
