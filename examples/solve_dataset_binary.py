@@ -26,17 +26,29 @@ from omt_branching.solver.binary_results import (
     has_binary_result,
     save_binary_result,
 )
-from omt_branching.solver.decide_omt import smt2_to_instance, solve_binary
+from omt_branching.solver.decide_omt import (
+    list_split_entries,
+    manifest_mismatches,
+    rebuild_manifest,
+    smt2_to_instance,
+    solve_binary,
+)
 
 ARTIFACTS = os.path.join(os.path.dirname(__file__), "artifacts")
 DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "decide_branch_dataset")
 DEFAULT_WORKERS = max(1, min(30, (os.cpu_count() or 4)))
 
 
-def _load_manifest(dataset_dir: str) -> dict:
+def _ensure_manifest(dataset_dir: str) -> dict:
     path = Path(dataset_dir) / "manifest.json"
-    if not path.is_file():
-        raise SystemExit(f"未找到 manifest.json: {path}")
+    issues = manifest_mismatches(dataset_dir)
+    if issues or not path.is_file():
+        if issues:
+            print("检测到 manifest 与磁盘不一致，按 .smt2 重建：")
+            for msg in issues:
+                print(f"  - {msg}")
+        rebuild_manifest(dataset_dir, preserve_meta=True)
+        print(f"已重建 -> {path}")
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
@@ -125,14 +137,18 @@ def main() -> None:
     if not z3_path:
         raise SystemExit("未找到 z3 二进制，请用 --z3-path 指定")
 
-    manifest = _load_manifest(args.dataset_dir)
+    manifest = _ensure_manifest(args.dataset_dir)
     splits = manifest.get("splits", {})
-    keys = [args.split] if args.split else list(splits.keys())
+    # 若 manifest 刚重建仍空，直接按磁盘列条目
+    keys = [args.split] if args.split else (
+        list(splits.keys()) or ["test", "train"]
+    )
     tasks: list[tuple] = []
     for sp in keys:
-        if sp not in splits:
-            raise SystemExit(f"manifest 中无划分: {sp}")
-        for entry in splits[sp]:
+        entries = splits.get(sp) or list_split_entries(args.dataset_dir, sp)
+        if args.split and sp == args.split and not entries:
+            raise SystemExit(f"划分无实例: {sp}")
+        for entry in entries:
             tasks.append((
                 args.dataset_dir,
                 sp,

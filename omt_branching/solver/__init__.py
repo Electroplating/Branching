@@ -45,6 +45,8 @@ from omt_branching.solver.policy_decider import PolicyDecider, solve_with_learne
 from omt_branching.solver.decide_omt import (
     instance_to_smt2, load_dataset, smt2_to_instance,
     solve_binary, solve_omt_with_decider, solve_native,
+    instance_manifest_entry, manifest_mismatches, rebuild_manifest,
+    save_dataset, list_split_entries,
 )
 from omt_branching.solver.binary_results import (
     binary_rlimit, binary_value, has_binary_result, load_binary_result,
@@ -125,6 +127,11 @@ __all__ = [
     "instance_to_smt2",
     "smt2_to_instance",
     "load_dataset",
+    "instance_manifest_entry",
+    "manifest_mismatches",
+    "rebuild_manifest",
+    "save_dataset",
+    "list_split_entries",
     "solve_omt_with_decider",
     "solve_native",
     "solve_binary",

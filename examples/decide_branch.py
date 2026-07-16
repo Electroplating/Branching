@@ -36,8 +36,11 @@ from omt_branching.solver.rl_decide import (
 )
 from omt_branching.solver import (
     generate_bool_lia_dataset,
-    instance_to_smt2,
     load_dataset,
+    list_split_entries,
+    manifest_mismatches,
+    rebuild_manifest,
+    save_dataset,
     solve_omt_with_decider,
 )
 from omt_branching.solver.binary_results import (
@@ -64,51 +67,27 @@ def _json_value(v):
     return v
 
 
-def _instance_manifest_entry(inst: OMTInstance, *, smt2_relpath: str) -> dict:
-    return {
-        "instance_id": inst.instance_id,
-        "theory": inst.theory,
-        "family": inst.family,
-        "description": inst.description,
-        "sense": inst.sense.value,
-        "n_vars": len(inst.variables),
-        "n_hard": len(inst.hard),
-        "obj_coeffs": inst.obj_coeffs,
-        "smt2": smt2_relpath,
-    }
-
-
-def save_dataset(
-    instances: list[OMTInstance],
-    out_dir: str,
-    *,
-    split: str,
-) -> list[dict]:
-    """把实例列表落盘：每个实例一个 .smt2，返回 manifest 条目。"""
-    split_dir = os.path.join(out_dir, split)
-    os.makedirs(split_dir, exist_ok=True)
-    entries: list[dict] = []
-    for inst in instances:
-        fname = f"{inst.instance_id}.smt2"
-        relpath = os.path.join(split, fname).replace("\\", "/")
-        with open(os.path.join(split_dir, fname), "w", encoding="utf-8") as f:
-            f.write(instance_to_smt2(inst))
-        entries.append(_instance_manifest_entry(inst, smt2_relpath=relpath))
-    return entries
-
-
 def _stats_for_json(stats: dict) -> dict:
     return {k: _json_value(v) for k, v in stats.items()}
 
 
 def dataset_exists(dataset_dir: str) -> bool:
-    return (Path(dataset_dir) / "manifest.json").is_file()
+    root = Path(dataset_dir)
+    if (root / "manifest.json").is_file():
+        return True
+    return any((root / sp).glob("*.smt2") for sp in ("test", "train"))
 
 
-def _manifest_entries(dataset_dir: str, split: str) -> list[dict]:
-    with open(Path(dataset_dir) / "manifest.json", encoding="utf-8") as f:
-        manifest = json.load(f)
-    return list(manifest.get("splits", {}).get(split, []))
+def _sync_manifest_if_needed(dataset_dir: str) -> None:
+    """若 manifest 与磁盘 .smt2 不一致，按磁盘重建。"""
+    issues = manifest_mismatches(dataset_dir)
+    if not issues:
+        return
+    print("检测到 manifest 与磁盘 .smt2 不一致，按磁盘重建 manifest：")
+    for msg in issues:
+        print(f"  - {msg}")
+    rebuild_manifest(dataset_dir, preserve_meta=True)
+    print(f"已重建 -> {Path(dataset_dir) / 'manifest.json'}")
 
 
 def _smt2_abs_paths(dataset_dir: str, entries: list[dict]) -> list[str]:
@@ -294,15 +273,16 @@ def main() -> None:
 
     if use_existing:
         print(f"使用已有数据集（smt2_to_instance）: {args.dataset_dir}")
+        _sync_manifest_if_needed(args.dataset_dir)
         with open(Path(args.dataset_dir) / "manifest.json", encoding="utf-8") as f:
             manifest = json.load(f)
-        test_entries = _manifest_entries(args.dataset_dir, "test")
+        test_entries = list_split_entries(args.dataset_dir, "test")
         if not test_entries:
             raise SystemExit(f"数据集无 test 划分: {args.dataset_dir}")
         insts = load_dataset(args.dataset_dir, split="test")
         print(f"测试集 {len(insts)} 个实例已从磁盘加载")
         if args.train > 0 or args.rl_iters > 0:
-            train_entries = _manifest_entries(args.dataset_dir, "train")
+            train_entries = list_split_entries(args.dataset_dir, "train")
             if not train_entries:
                 raise SystemExit(
                     "需要 train 划分但数据集中没有；请用 --force-regen 重新生成，"
@@ -352,6 +332,7 @@ def main() -> None:
                 f"训练集 {len(train_insts)} 个实例已保存 -> {args.dataset_dir}/train/"
             )
 
+        # 直接写入完整 manifest（条目来自刚落盘的实例；save_dataset 已 prune 残留）
         manifest_path = os.path.join(args.dataset_dir, "manifest.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=4, ensure_ascii=False)
@@ -375,7 +356,7 @@ def main() -> None:
         if not train_insts:
             train_insts = load_dataset(args.dataset_dir, split="train")
         if not train_entries:
-            train_entries = _manifest_entries(args.dataset_dir, "train")
+            train_entries = list_split_entries(args.dataset_dir, "train")
 
         lookahead_workers = args.test_workers
         paths = _smt2_abs_paths(args.dataset_dir, train_entries)
@@ -405,7 +386,7 @@ def main() -> None:
         if not train_insts:
             train_insts = load_dataset(args.dataset_dir, split="train")
         if not train_entries:
-            train_entries = _manifest_entries(args.dataset_dir, "train")
+            train_entries = list_split_entries(args.dataset_dir, "train")
         rl_train = train_insts
         rl_paths = _smt2_abs_paths(args.dataset_dir, train_entries)
         rl_ids = [e["instance_id"] for e in train_entries]

@@ -379,36 +379,271 @@ def smt2_to_instance(source, *, instance_id: str | None = None,
 
 
 def load_dataset(path, *, split: str | None = None) -> list[OMTInstance]:
-    """读回 ``save_dataset`` 落盘的数据集（``manifest.json`` + 各 ``.smt2``）。
+    """读回落盘数据集（``.smt2`` 为权威；``manifest.json`` 仅补充标签）。
 
-    ``path``：数据集目录或 ``manifest.json`` 路径。有 manifest 时按其 ``splits`` 枚举 ``.smt2``
-    文件；``split`` 可只取某一划分。无 manifest 时退化为「目录下每个 ``.smt2`` 各读一份」。
+    ``path``：数据集目录或 ``manifest.json`` 路径。
 
-    **权威来源是 ``.smt2`` 本身**：求解相关字段（``hard/objective/sense/variables/obj_coeffs/
-    theory``）一律自包含地从文件恢复——因为文件才是真正被求解的对象，manifest 可能过期/错位。
-    manifest 仅提供**标签**（``instance_id/family/description``，非文件内可推），best-effort 覆盖。
+    **枚举与求解字段以磁盘 ``.smt2`` 为准**（``test/``、``train/`` 等划分目录下的文件）。
+    若存在 ``manifest.json``，仅用其 ``instance_id/family/description`` 做 best-effort 覆盖；
+    不再信任可能过期的 manifest 文件列表。无划分目录时退化为 ``rglob("*.smt2")``。
     """
     root = Path(path)
     manifest_path = root if root.is_file() else root / "manifest.json"
     if root.is_file():
         root = root.parent
 
-    if not manifest_path.exists():
-        return [smt2_to_instance(f) for f in sorted(root.rglob("*.smt2"))]
+    label_by_key: dict[tuple[str, str], dict] = {}
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for sp, entries in manifest.get("splits", {}).items():
+            for entry in entries:
+                iid = entry.get("instance_id") or Path(entry.get("smt2", "")).stem
+                if iid:
+                    label_by_key[(sp, iid)] = entry
+
+    split_dirs = _discover_split_dirs(root)
+    if split is not None:
+        split_dirs = [split] if (root / split).is_dir() else []
+
+    out: list[OMTInstance] = []
+    if split_dirs:
+        for sp in split_dirs:
+            for smt2_path in sorted((root / sp).glob("*.smt2")):
+                labels = label_by_key.get((sp, smt2_path.stem), {})
+                out.append(smt2_to_instance(
+                    smt2_path,
+                    instance_id=labels.get("instance_id") or smt2_path.stem,
+                    family=labels.get("family", "imported"),
+                    description=labels.get("description", ""),
+                ))
+        return out
+
+    # 无标准划分目录：扫全部 .smt2（跳过仅作缓存的无关路径）
+    return [smt2_to_instance(f) for f in sorted(root.rglob("*.smt2"))]
+
+
+def _discover_split_dirs(root: Path) -> list[str]:
+    """返回含 ``*.smt2`` 的一级子目录名（排除 ``binary``）。"""
+    skip = {"binary"}
+    found: list[str] = []
+    if not root.is_dir():
+        return found
+    for p in sorted(root.iterdir()):
+        if p.is_dir() and p.name not in skip and any(p.glob("*.smt2")):
+            found.append(p.name)
+    return found
+
+
+def instance_manifest_entry(inst: OMTInstance, *, smt2_relpath: str) -> dict:
+    """由 ``OMTInstance`` 构造一条 manifest 条目（与 ``save_dataset`` 一致）。"""
+    return {
+        "instance_id": inst.instance_id,
+        "theory": inst.theory,
+        "family": inst.family,
+        "description": inst.description,
+        "sense": inst.sense.value,
+        "n_vars": len(inst.variables),
+        "n_hard": len(inst.hard),
+        "obj_coeffs": inst.obj_coeffs,
+        "smt2": smt2_relpath.replace("\\", "/"),
+    }
+
+
+def manifest_mismatches(dataset_dir) -> list[str]:
+    """检查 manifest 与磁盘 ``.smt2`` 是否一致，返回问题描述列表（空=一致）。"""
+    root = Path(dataset_dir)
+    manifest_path = root / "manifest.json"
+    issues: list[str] = []
+    if not manifest_path.is_file():
+        if _discover_split_dirs(root):
+            issues.append("存在 .smt2 划分目录但缺少 manifest.json")
+        return issues
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     splits = manifest.get("splits", {})
-    keys = [split] if split is not None else list(splits.keys())
-    out: list[OMTInstance] = []
-    for sp in keys:
-        for entry in splits.get(sp, []):
-            out.append(smt2_to_instance(
-                root / entry["smt2"],
-                instance_id=entry.get("instance_id"),
-                family=entry.get("family", "imported"),
-                description=entry.get("description", ""),
-            ))
-    return out
+    disk_splits = set(_discover_split_dirs(root))
+    listed_splits = {sp for sp, ents in splits.items() if ents}
+
+    for sp in sorted(disk_splits | listed_splits):
+        disk_files = {p.name for p in (root / sp).glob("*.smt2")} if (root / sp).is_dir() else set()
+        listed = {
+            Path(e["smt2"]).name
+            for e in splits.get(sp, [])
+            if e.get("smt2")
+        }
+        extra = disk_files - listed
+        missing = listed - disk_files
+        if extra:
+            issues.append(f"{sp}/: 磁盘有但 manifest 未列: {sorted(extra)}")
+        if missing:
+            issues.append(f"{sp}/: manifest 有但磁盘缺失: {sorted(missing)}")
+        for e in splits.get(sp, []):
+            rel = e.get("smt2")
+            if not rel:
+                continue
+            p = root / rel
+            if not p.is_file():
+                continue
+            inst = smt2_to_instance(p, instance_id=e.get("instance_id"))
+            if e.get("sense") and e["sense"] != inst.sense.value:
+                issues.append(
+                    f"{rel}: sense manifest={e['sense']} smt2={inst.sense.value}"
+                )
+            if e.get("theory") and e["theory"] != inst.theory:
+                issues.append(
+                    f"{rel}: theory manifest={e['theory']} smt2={inst.theory}"
+                )
+            if e.get("n_vars") is not None and int(e["n_vars"]) != len(inst.variables):
+                issues.append(
+                    f"{rel}: n_vars manifest={e['n_vars']} smt2={len(inst.variables)}"
+                )
+            if e.get("n_hard") is not None and int(e["n_hard"]) != len(inst.hard):
+                issues.append(
+                    f"{rel}: n_hard manifest={e['n_hard']} smt2={len(inst.hard)}"
+                )
+            if e.get("obj_coeffs") is not None:
+                mc = {k: float(v) for k, v in e["obj_coeffs"].items()}
+                ac = {k: float(v) for k, v in inst.obj_coeffs.items()}
+                if mc != ac:
+                    issues.append(f"{rel}: obj_coeffs 与 smt2 不一致")
+    return issues
+
+
+def _infer_family_description(instance_id: str) -> tuple[str, str]:
+    """无旧标签时，按 id 前缀猜测 family/description。"""
+    if instance_id.startswith("hblia"):
+        return "bool", "hard bool LIA (imported)"
+    if instance_id.startswith("blia"):
+        return "bool", "bool LIA (imported)"
+    if instance_id.startswith("hlia"):
+        return "knapsack", "hard LIA (imported)"
+    if instance_id.startswith("lra"):
+        return "imported", "LRA (imported)"
+    return "imported", ""
+
+
+def rebuild_manifest(
+    dataset_dir,
+    *,
+    preserve_meta: bool = True,
+) -> dict:
+    """按磁盘 ``.smt2`` 重建 ``manifest.json``（``.smt2`` 为权威）。
+
+    ``preserve_meta=True`` 时保留旧 manifest 的 ``generator/params/seeds/created_at``，
+    以及同 id 的 ``family/description``；``params.test/train`` 按实际文件数更新。
+    """
+    from datetime import datetime, timezone
+
+    root = Path(dataset_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    old: dict = {}
+    manifest_path = root / "manifest.json"
+    if preserve_meta and manifest_path.is_file():
+        old = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    old_labels: dict[tuple[str, str], dict] = {}
+    for sp, entries in old.get("splits", {}).items():
+        for e in entries:
+            iid = e.get("instance_id") or Path(e.get("smt2", "")).stem
+            if iid:
+                old_labels[(sp, iid)] = e
+
+    splits: dict[str, list] = {}
+    for sp in _discover_split_dirs(root):
+        entries: list[dict] = []
+        for smt2_path in sorted((root / sp).glob("*.smt2")):
+            labels = old_labels.get((sp, smt2_path.stem), {})
+            iid = labels.get("instance_id") or smt2_path.stem
+            fam = labels.get("family")
+            desc = labels.get("description")
+            if not fam or fam == "imported":
+                inferred_f, inferred_d = _infer_family_description(iid)
+                fam = fam if fam and fam != "imported" else inferred_f
+                if not desc:
+                    desc = inferred_d
+            inst = smt2_to_instance(
+                smt2_path,
+                instance_id=iid,
+                family=fam or "imported",
+                description=desc or "",
+            )
+            rel = f"{sp}/{smt2_path.name}"
+            entries.append(instance_manifest_entry(inst, smt2_relpath=rel))
+        splits[sp] = entries
+
+    params = dict(old.get("params") or {})
+    if "test" in splits:
+        params["test"] = len(splits["test"])
+    if "train" in splits:
+        params["train"] = len(splits["train"])
+
+    manifest = {
+        "created_at": old.get("created_at")
+        or datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "generator": old.get("generator", "imported"),
+        "params": params,
+        "seeds": old.get("seeds", {}),
+        "splits": splits,
+    }
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=4, ensure_ascii=False)
+    return manifest
+
+
+def save_dataset(
+    instances: list[OMTInstance],
+    out_dir,
+    *,
+    split: str,
+    prune_orphans: bool = True,
+) -> list[dict]:
+    """把实例列表落盘为 ``<out_dir>/<split>/<id>.smt2``，返回 manifest 条目。
+
+    ``prune_orphans=True`` 时删除该划分下未出现在本次写入列表中的旧 ``.smt2``，
+    避免 manifest 与磁盘残留文件不一致。
+    """
+    split_dir = Path(out_dir) / split
+    split_dir.mkdir(parents=True, exist_ok=True)
+    entries: list[dict] = []
+    keep: set[str] = set()
+    for inst in instances:
+        fname = f"{inst.instance_id}.smt2"
+        keep.add(fname)
+        relpath = f"{split}/{fname}"
+        (split_dir / fname).write_text(instance_to_smt2(inst), encoding="utf-8")
+        entries.append(instance_manifest_entry(inst, smt2_relpath=relpath))
+    if prune_orphans:
+        for old in split_dir.glob("*.smt2"):
+            if old.name not in keep:
+                old.unlink(missing_ok=True)
+    return entries
+
+
+def list_split_entries(dataset_dir, split: str) -> list[dict]:
+    """返回某划分的 manifest 风格条目（始终按磁盘 ``.smt2`` 现算）。"""
+    root = Path(dataset_dir)
+    manifest_path = root / "manifest.json"
+    labels: dict[str, dict] = {}
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for e in manifest.get("splits", {}).get(split, []):
+            iid = e.get("instance_id") or Path(e.get("smt2", "")).stem
+            if iid:
+                labels[iid] = e
+    entries: list[dict] = []
+    for smt2_path in sorted((root / split).glob("*.smt2")):
+        lab = labels.get(smt2_path.stem, {})
+        inst = smt2_to_instance(
+            smt2_path,
+            instance_id=lab.get("instance_id") or smt2_path.stem,
+            family=lab.get("family", "imported"),
+            description=lab.get("description", ""),
+        )
+        entries.append(
+            instance_manifest_entry(inst, smt2_relpath=f"{split}/{smt2_path.name}")
+        )
+    return entries
 
 
 def _parse_smt_num(token: str) -> Optional[Fraction]:
@@ -567,6 +802,11 @@ __all__ = [
     "instance_to_smt2",
     "smt2_to_instance",
     "load_dataset",
+    "instance_manifest_entry",
+    "manifest_mismatches",
+    "rebuild_manifest",
+    "save_dataset",
+    "list_split_entries",
     "solve_omt_with_decider",
     "solve_native",
     "solve_binary",
