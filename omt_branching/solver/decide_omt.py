@@ -565,6 +565,8 @@ def solve_binary(
 
 __all__ = [
     "instance_to_smt2",
+    "smt2_to_instance",
+    "load_dataset",
     "solve_omt_with_decider",
     "solve_native",
     "solve_binary",

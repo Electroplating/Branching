@@ -226,6 +226,17 @@ def _lookahead_example_worker(task: tuple) -> tuple[int, RankingExample | None]:
     return index, _build_lookahead_one(inst, cfg)
 
 
+def _lookahead_from_smt2_worker(task: tuple) -> tuple[int, RankingExample | None]:
+    """ProcessPool worker：从已落盘 ``.smt2`` 读实例并构造 look-ahead 样本。"""
+    index, smt2_path, instance_id, max_atoms, eps = task
+    from omt_branching.solver.decide_omt import smt2_to_instance
+    from omt_branching.solver.lookahead import LookaheadConfig
+
+    inst = smt2_to_instance(smt2_path, instance_id=instance_id)
+    cfg = LookaheadConfig(max_atoms=max_atoms, eps=eps)
+    return index, _build_lookahead_one(inst, cfg)
+
+
 def build_lookahead_examples(instances, config=None):
     """从布尔结构实例构造 look-ahead imitation 样本（bool head ranking + phase）。
 
@@ -289,6 +300,53 @@ def build_lookahead_examples_parallel(
     return [ex for ex in slots if ex is not None]
 
 
+def build_lookahead_examples_from_smt2_parallel(
+    smt2_paths: list[str],
+    *,
+    instance_ids: list[str] | None = None,
+    config=None,
+    workers: int = DEFAULT_LOOKAHEAD_WORKERS,
+) -> list[RankingExample]:
+    """从已落盘 ``.smt2`` 并行构造 look-ahead 样本（不重新生成实例）。"""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    from omt_branching.solver.lookahead import LookaheadConfig
+
+    if not smt2_paths:
+        return []
+    cfg = config or LookaheadConfig()
+    ids = instance_ids or [None] * len(smt2_paths)
+    if len(ids) != len(smt2_paths):
+        raise ValueError("instance_ids 长度必须与 smt2_paths 一致")
+    if workers <= 1:
+        from omt_branching.solver.decide_omt import smt2_to_instance
+
+        out: list[RankingExample] = []
+        for path, iid in zip(smt2_paths, ids):
+            inst = smt2_to_instance(path, instance_id=iid)
+            ex = _build_lookahead_one(inst, cfg)
+            if ex is not None:
+                out.append(ex)
+        return out
+
+    n = len(smt2_paths)
+    workers = min(workers, n)
+    max_atoms, eps = cfg.max_atoms, cfg.eps
+    tasks = [
+        (i, smt2_paths[i], ids[i], max_atoms, eps) for i in range(n)
+    ]
+    slots: list[RankingExample | None] = [None] * n
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_lookahead_from_smt2_worker, t) for t in tasks]
+        with tqdm(total=len(tasks), desc="lookahead") as pbar:
+            for fut in as_completed(futures):
+                index, ex = fut.result()
+                if ex is not None:
+                    slots[index] = ex
+                pbar.update(1)
+    return [ex for ex in slots if ex is not None]
+
+
 def build_lookahead_examples_sat(problems, config=None):
     """SAT look-ahead imitation 样本：``problems = list[(atoms, clauses)]``（同生成器返回序）。"""
     from omt_branching.solver.lookahead import LookaheadConfig, lookahead_scores
@@ -322,6 +380,7 @@ __all__ = [
     "build_imitation_examples",
     "build_lookahead_examples",
     "build_lookahead_examples_parallel",
+    "build_lookahead_examples_from_smt2_parallel",
     "build_lookahead_examples_sat",
     "policy_numeric_choice",
     "baseline_numeric_choice",

@@ -125,7 +125,7 @@ def _make_rl_process_pool(workers: int) -> ProcessPoolExecutor:
 
 
 def _rl_collect_worker(task: tuple) -> tuple:
-    """ProcessPool worker：按 index/seed 重建实例并 collect（独立 z3 Context，GNN 在 CPU）。"""
+    """ProcessPool worker：从 smt2 或按 index/seed 重建实例并 collect。"""
     (
         inst_idx,
         seed,
@@ -137,12 +137,19 @@ def _rl_collect_worker(task: tuple) -> tuple:
         refocus_every,
         max_iters,
         device,
+        smt2_path,
+        instance_id,
     ) = task
-    from omt_branching.solver.instance_gen import bool_lia_instance_at
+    if smt2_path:
+        from omt_branching.solver.decide_omt import smt2_to_instance
 
-    inst = bool_lia_instance_at(
-        inst_idx, seed, hard=hard, min_vars=min_vars, max_vars=max_vars
-    )
+        inst = smt2_to_instance(smt2_path, instance_id=instance_id)
+    else:
+        from omt_branching.solver.instance_gen import bool_lia_instance_at
+
+        inst = bool_lia_instance_at(
+            inst_idx, seed, hard=hard, min_vars=min_vars, max_vars=max_vars
+        )
     hard_exprs, obj, sense = inst.as_tuple()
 
     policy = BranchingPolicy()
@@ -235,11 +242,17 @@ class DecideRLTrainer:
         pool: ProcessPoolExecutor,
         pbar=None,
         iter_idx: int = 0,
+        smt2_paths: list[str] | None = None,
+        instance_ids: list[str] | None = None,
     ) -> list[tuple[int, list, float, dict]]:
         """多进程 collect；worker 固定 CPU，主进程 update 阶段再用 GPU。"""
         policy_state = _policy_state_cpu(self.policy)
         defer_val = float(self.defer_logit.detach().cpu())
         worker_device = "cpu"
+        paths = smt2_paths or [None] * count
+        ids = instance_ids or [None] * count
+        if len(paths) != count or len(ids) != count:
+            raise ValueError("smt2_paths / instance_ids 长度必须等于实例数")
         tasks = [
             (
                 j,
@@ -252,6 +265,8 @@ class DecideRLTrainer:
                 self.config.refocus_every,
                 self.config.max_iters,
                 worker_device,
+                paths[j],
+                ids[j],
             )
             for j in range(count)
         ]
@@ -266,6 +281,16 @@ class DecideRLTrainer:
                 pbar.set_postfix(iter=iter_idx, phase="collect", inst=f"{done}/{count}")
         results.sort(key=lambda x: x[0])
         return results
+
+    def save_checkpoint(self, path, *, meta: dict | None = None) -> None:
+        """保存策略权重 + ``defer_logit``（写入 ``meta``）。"""
+        from omt_branching.model.persistence import save_policy
+
+        payload_meta = {
+            "defer_logit": float(self.defer_logit.detach().cpu()),
+            **(meta or {}),
+        }
+        save_policy(self.policy, path, meta=payload_meta)
 
     def collect_sat(self, assertions, atoms):
         from omt_branching.solver.sat_solve import solve_sat_with_decider
@@ -348,10 +373,22 @@ class DecideRLTrainer:
         collect_hard: bool = False,
         collect_min_vars: int = 5,
         collect_max_vars: int = 7,
+        smt2_paths: list[str] | None = None,
+        instance_ids: list[str] | None = None,
+        checkpoint_dir: str | None = None,
+        checkpoint_every: int = 1,
     ):
-        """REINFORCE 训练。``workers>1`` 且实例数足够时用 spawn 进程池并行 collect。"""
+        """REINFORCE 训练。``workers>1`` 且实例数足够时用 spawn 进程池并行 collect。
+
+        ``smt2_paths`` 非空时 worker 从落盘文件读实例（与已有 dataset 对齐），否则按
+        seed 重建。``checkpoint_dir`` 非空时每隔 ``checkpoint_every`` 轮保存中间权重。
+        """
         instances = list(instances)
         count = len(instances)
+        if smt2_paths is not None and len(smt2_paths) != count:
+            raise ValueError("smt2_paths 长度必须等于 instances")
+        if instance_ids is not None and len(instance_ids) != count:
+            raise ValueError("instance_ids 长度必须等于 instances")
         requested = workers if workers is not None else self.config.workers
         n_workers = effective_rl_workers(
             count,
@@ -359,10 +396,13 @@ class DecideRLTrainer:
             min_instances=self.config.min_instances_for_parallel,
         )
         use_parallel = n_workers > 1
+        # 有 smt2 路径时并行可走路径；无路径时仍用 seed 重建
         history = []
         pool: ProcessPoolExecutor | None = None
         if use_parallel:
             pool = _make_rl_process_pool(n_workers)
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
         try:
             with tqdm(total=iterations * count, desc="rl_train") as pbar:
                 for it in range(iterations):
@@ -377,6 +417,8 @@ class DecideRLTrainer:
                             pool=pool,
                             pbar=pbar,
                             iter_idx=it,
+                            smt2_paths=smt2_paths,
+                            instance_ids=instance_ids,
                         )
                         for upd_i, (j, steps, reward, res) in enumerate(batch):
                             stats = self.update(steps, reward, key=j)
@@ -416,6 +458,18 @@ class DecideRLTrainer:
                                     f"conflicts={res['conflicts']} steps={stats['steps']}"
                                 )
                             pbar.update(1)
+                    if (
+                        checkpoint_dir
+                        and checkpoint_every > 0
+                        and (it + 1) % checkpoint_every == 0
+                    ):
+                        ckpt = os.path.join(
+                            checkpoint_dir, f"iter_{it + 1:04d}.pt"
+                        )
+                        self.save_checkpoint(
+                            ckpt,
+                            meta={"iter": it + 1, "iterations": iterations},
+                        )
         finally:
             if pool is not None:
                 pool.shutdown(wait=True)

@@ -5,9 +5,16 @@
 """
 from __future__ import annotations
 
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
-from omt_branching.service import BranchingPolicyService
+from omt_branching.model.device import gnn_device
+from omt_branching.model.inference import InferenceConfig
+from omt_branching.model.persistence import load_policy
+from omt_branching.model.policy import BranchingPolicy
+from omt_branching.service import BranchingPolicyService, ServiceConfig
+from omt_branching.solver.decide_omt import solve_omt_with_decider
+from omt_branching.solver.interfaces import Sense
 from omt_branching.solver.propagator_snapshot import build_bool_snapshot
 
 
@@ -48,4 +55,40 @@ class PolicyDecider:
         return best, bool(self._phase.get(best, True))
 
 
-__all__ = ["PolicyDecider"]
+def solve_with_learned_policy(
+    hard,
+    objective,
+    sense: Sense,
+    *,
+    checkpoint: Union[str, Path, None] = None,
+    policy: BranchingPolicy | None = None,
+    refocus_every: int = 50,
+    device: str | None = None,
+    max_iters: int = 100000,
+) -> dict:
+    """用 checkpoint / 已有 ``BranchingPolicy`` + :class:`PolicyDecider` 求解单实例。
+
+    ``checkpoint`` 为 :func:`omt_branching.model.persistence.save_policy` 写出的 ``.pt``；
+    与 ``policy`` 二选一（同时给时以 ``policy`` 为准）。便于调试 RL 中间/最终权重。
+    """
+    if policy is None:
+        if checkpoint is None:
+            raise ValueError("必须提供 checkpoint 或 policy")
+        policy, _meta = load_policy(checkpoint, map_location="cpu")
+    dev = device or gnn_device()
+    policy = policy.to(dev)
+    policy.eval()
+    svc = BranchingPolicyService(
+        policy=policy,
+        config=ServiceConfig(inference=InferenceConfig(device=dev)),
+    )
+    return solve_omt_with_decider(
+        hard,
+        objective,
+        sense,
+        decider_factory=lambda a: PolicyDecider(svc, a, refocus_every),
+        max_iters=max_iters,
+    )
+
+
+__all__ = ["PolicyDecider", "solve_with_learned_policy"]
