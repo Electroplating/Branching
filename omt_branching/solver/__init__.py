@@ -38,7 +38,7 @@ from omt_branching.solver.training_data import (
     baseline_numeric_choice, bool_branch_hit,
 )
 from omt_branching.solver.propagator_snapshot import (
-    atom_key, build_bool_snapshot, collect_atoms,
+    atom_key, build_bool_snapshot, clear_bool_snapshot_cache, collect_atoms,
 )
 from omt_branching.solver.propagator import LearnedDecidePropagator
 from omt_branching.solver.policy_decider import PolicyDecider, solve_with_learned_policy
@@ -124,6 +124,7 @@ __all__ = [
     "atom_key",
     "collect_atoms",
     "build_bool_snapshot",
+    "clear_bool_snapshot_cache",
     "LearnedDecidePropagator",
     "PolicyDecider",
     "solve_with_learned_policy",

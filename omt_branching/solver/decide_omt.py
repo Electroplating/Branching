@@ -49,11 +49,12 @@ def solve_omt_with_decider(
     max_iters: int = 100000,
     ctx: z3.Context | None = None,
     *,
-    ref_rlimit: int,
+    ref_rlimit: int | None = None,
 ) -> dict:
     """OMT 线性搜索；默认在独立 :class:`z3.Context` 内运行，避免跨线程/跨求解共享表达式。
-    使用ref_rlimit剪枝, 当前消耗超出2 * reflimit 时可直接返回, 此时计算得到的reward为-2.0
-    weight_rlimit加权, 范围保证在(rlimit, 2 * rlimit)开区间内, 用于计算reward
+
+    若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时可提前返回（reward 侧按 -2.0
+    处理）；未给定时不做该剪枝。
     """
     if ctx is None:
         ctx = z3.Context()
@@ -89,7 +90,7 @@ def solve_omt_with_decider(
 
     iters = 0
     for iters in range(1, max_iters + 1):
-        if rlimit - solver_rlimit > 2 * ref_rlimit:
+        if ref_rlimit is not None and rlimit - solver_rlimit > 2 * ref_rlimit:
             break
         cut = obj_iso > best_val if sense is Sense.MAX else obj_iso < best_val
         s.add(cut)

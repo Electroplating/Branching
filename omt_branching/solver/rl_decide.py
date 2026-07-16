@@ -42,7 +42,7 @@ def decide_rl_reward(res: dict, ref_val, ref_rlimit) -> float:
     if ref_val is not None and (res.get("value") is None or res["value"] != ref_val):
         return -2.0
     assert (ref_rlimit is not None) and ref_rlimit > 0
-    ratio = max(res.get("weighted_rlimit") / ref_rlimit, 2.0)
+    ratio = min(1.0 * res.get("weighted_rlimit") / ref_rlimit, 2.0)
     return 1.0 - ratio
 
 

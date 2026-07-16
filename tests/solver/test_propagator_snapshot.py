@@ -3,7 +3,10 @@ import pytest
 z3 = pytest.importorskip("z3")
 
 from omt_branching.solver.propagator_snapshot import (
-    atom_key, collect_atoms, build_bool_snapshot,
+    atom_key,
+    collect_atoms,
+    build_bool_snapshot,
+    clear_bool_snapshot_cache,
 )
 
 
@@ -81,3 +84,23 @@ def test_linear_decomposition_branches():
     r = z3.Real("r")
     c, k = _linear(r + z3.RealVal("3/2"))
     assert c[str(r)] == 1.0 and abs(k - 1.5) < 1e-9
+
+
+def test_static_cache_reuses_structure_updates_assignment():
+    """同 assertions 二次调用应命中静态缓存，且 assignment 仍正确更新。"""
+    clear_bool_snapshot_cache()
+    x = z3.Int("x")
+    a, b = x >= 5, x <= 2
+    asserts = [z3.Or(a, b)]
+    snap1, amap1 = build_bool_snapshot(asserts)
+    snap2, amap2 = build_bool_snapshot(
+        asserts, assignment={atom_key(a): True}, stats={"conflicts": 3}
+    )
+    assert amap1 is amap2  # 静态 amap 复用
+    assert snap1.clauses is snap2.clauses
+    assert snap1.theory_atoms is snap2.theory_atoms
+    by_id = {bv.var_id: bv for bv in snap2.bool_vars}
+    assert by_id[atom_key(a)].assignment is True
+    assert by_id[atom_key(b)].assignment is None
+    assert snap2.search_state.conflict_count == 3
+    assert snap1.search_state.conflict_count == 0
