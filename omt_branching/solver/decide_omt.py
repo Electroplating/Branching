@@ -22,7 +22,7 @@ import z3
 from omt_branching.solver.instance_gen import OMTInstance
 from omt_branching.solver.interfaces import Sense
 from omt_branching.solver.propagator import LearnedDecidePropagator
-from omt_branching.solver.propagator_snapshot import collect_atoms
+from omt_branching.solver.propagator_snapshot import prepare_propagator_formula
 
 
 def _stat(s, key):
@@ -50,11 +50,15 @@ def solve_omt_with_decider(
     ctx: z3.Context | None = None,
     *,
     ref_rlimit: int | None = None,
+    sample: bool = False,
 ) -> dict:
     """OMT 线性搜索；默认在独立 :class:`z3.Context` 内运行，避免跨线程/跨求解共享表达式。
 
     若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时可提前返回（reward 侧按 -2.0
     处理）；未给定时不做该剪枝。
+    若给定 ``decider_factory``：先对硬约束做轻量预处理，再只向 propagator 注册
+    **析取子句**（字面量数 ≥ 2）中的原子，并在简化后的断言上 ``check``。
+    若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时可提前返回；未给定则不剪枝。
     """
     if ctx is None:
         ctx = z3.Context()
@@ -65,14 +69,16 @@ def solve_omt_with_decider(
     solver_rlimit = _stat(s, "rlimit count")
     rlimit = solver_rlimit
     prop = None
+    # 有 decider 时：先无 prop 预处理，再只注册析取子句原子，并对简化后公式求解。
+    hard_use = hard_iso
     if decider_factory is not None:
-        atoms = collect_atoms(hard_iso)
-        decider = decider_factory(hard_iso)
+        hard_use, atoms = prepare_propagator_formula(hard_iso)
+        decider = decider_factory(hard_use)
         prop = LearnedDecidePropagator(s, atoms, decider)
     decider_factory_rlimit = _stat(s, "rlimit count") - rlimit
     rlimit += decider_factory_rlimit
 
-    s.add(*hard_iso)
+    s.add(*hard_use)
     model_rlimit = [_stat(s, "rlimit count") - rlimit]
     rlimit += model_rlimit[-1]
 
@@ -90,7 +96,7 @@ def solve_omt_with_decider(
 
     iters = 0
     for iters in range(1, max_iters + 1):
-        if ref_rlimit is not None and rlimit - solver_rlimit > 2 * ref_rlimit:
+        if sample and rlimit - solver_rlimit > 2 * ref_rlimit:
             break
         cut = obj_iso > best_val if sense is Sense.MAX else obj_iso < best_val
         s.add(cut)

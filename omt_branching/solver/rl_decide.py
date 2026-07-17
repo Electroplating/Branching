@@ -298,6 +298,7 @@ def _rl_collect_worker(task: tuple) -> tuple:
         decider_factory=factory,
         max_iters=max_iters,
         ref_rlimit=ref_rlimit,
+        sample=True,
     )
     steps = holder["d"].steps if "d" in holder else []
     reward = decide_rl_reward(res, ref_value, ref_rlimit)
@@ -357,6 +358,7 @@ class DecideRLTrainer:
             decider_factory=factory,
             max_iters=self.config.max_iters,
             ref_rlimit=ref_rlimit,
+            sample=True,
         )
         steps = holder["d"].steps if "d" in holder else []
         reward = decide_rl_reward(res, ref_value, ref_rlimit)

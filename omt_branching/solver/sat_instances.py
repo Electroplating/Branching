@@ -38,14 +38,14 @@ def generate_hard_smt_lia(n_vars: int = 8, n_disj: int = 30, k: int = 3,
     系数 [-chi,chi]、小域 [0,ub] 使布尔搜索成瓶颈（附 propagator 数百 conflicts）。返回
     (atoms, clauses)，``atoms``=出现的理论原子（供 propagator 分支）。
     """
-    from omt_branching.solver.propagator_snapshot import collect_atoms
+    from omt_branching.solver.propagator_snapshot import collect_clause_atoms
 
     rng = random.Random(seed)
     xs = [z3.Int(f"y{i}") for i in range(n_vars)]
     clauses = []
     for x in xs:
-        clauses.append(z3.Or(x >= 0))          # 盒下界（原子形式，便于 collect_atoms 收录）
-        clauses.append(z3.Or(x <= ub))
+        clauses.append(x >= 0)                 # 单元盒界：不参与 prop 注册
+        clauses.append(x <= ub)
     for _ in range(n_disj):
         lits = []
         for _ in range(k):
@@ -56,7 +56,8 @@ def generate_hard_smt_lia(n_vars: int = 8, n_disj: int = 30, k: int = 3,
             b = rng.randint(-ub, ub * chi)
             lits.append(lhs <= b if rng.random() < 0.5 else lhs >= b)
         clauses.append(z3.Or(*lits))
-    atoms = collect_atoms(clauses)
+    # 仅析取子句原子（与 LearnedDecidePropagator 注册策略一致）
+    atoms = collect_clause_atoms(clauses)
     return atoms, clauses
 
 

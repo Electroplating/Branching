@@ -5,6 +5,9 @@ z3 = pytest.importorskip("z3")
 from omt_branching.solver.propagator_snapshot import (
     atom_key,
     collect_atoms,
+    collect_clause_atoms,
+    preprocess_assertions,
+    prepare_propagator_formula,
     build_bool_snapshot,
     clear_bool_snapshot_cache,
 )
@@ -30,6 +33,45 @@ def test_collect_atoms_and_clause_cooccurrence():
     assert pol[atom_key(a)] is False
     # 映射能取回 z3 原子
     assert amap[atom_key(a)] is not None
+
+
+def test_collect_clause_atoms_skips_unit_keeps_disjunction():
+    """注册原子：单元盒界不收录，析取子句中的原子收录。"""
+    x = z3.Int("x")
+    a, b = x >= 5, x <= 2
+    box_lo, box_hi = x >= 0, x <= 10
+    asserts = [box_lo, box_hi, z3.Or(a, b)]
+    all_keys = {atom_key(t) for t in collect_atoms(asserts)}
+    reg_keys = {atom_key(t) for t in collect_clause_atoms(asserts)}
+    assert {atom_key(box_lo), atom_key(box_hi), atom_key(a), atom_key(b)} <= all_keys
+    assert atom_key(a) in reg_keys and atom_key(b) in reg_keys
+    assert atom_key(box_lo) not in reg_keys
+    assert atom_key(box_hi) not in reg_keys
+
+
+def test_preprocess_then_clause_atoms_via_prepare():
+    """预处理 + 析取原子：prepare_propagator_formula 返回同 ctx 公式与注册集。"""
+    x = z3.Int("x")
+    a, b = x >= 5, x <= 2
+    # 冗余真值单元：simplify/propagate 后应被消掉或弱化
+    asserts = [x >= 0, x <= 10, z3.Or(a, b), z3.BoolVal(True)]
+    pp, atoms = prepare_propagator_formula(asserts)
+    assert pp, "预处理后应仍有断言"
+    assert all(hasattr(f, "ctx") and f.ctx == asserts[0].ctx for f in pp)
+    reg = {atom_key(t) for t in atoms}
+    # 析取分支原子应仍在注册集（或预处理改写后仍为 ≥2 元子句的原子）
+    assert reg <= {atom_key(t) for t in collect_atoms(pp)}
+    # 单元盒界即使仍在 pp 中也不应单独构成注册（除非被并进多元 Or）
+    assert atom_key(x >= 0) not in reg or len(collect_clause_atoms([x >= 0])) == 0
+
+
+def test_preprocess_assertions_idempotent_sat():
+    x = z3.Int("x")
+    asserts = [x >= 0, x <= 3, z3.Or(x >= 1, x <= 0)]
+    pp = preprocess_assertions(asserts)
+    s = z3.Solver()
+    s.add(*pp)
+    assert s.check() == z3.sat
 
 
 def test_assignment_and_candidates():

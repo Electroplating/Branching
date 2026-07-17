@@ -1,14 +1,13 @@
 """从 z3 布尔公式构造 SolverSnapshot（供 UserPropagator 学习分支）。
 
-抽取原子（比较原子 + 布尔常量）与**子句共现图**（每个顶层 assertion 的原子构成一个 clause），
-配合 propagator 提供的动态赋值/统计，喂给现有 GNN 策略。子句图是学习"好决策"的关键结构
-（见 spec §5：无子句图极可能学不动）。
+抽取原子（比较原子 + 布尔常量）与**子句共现图**，配合 propagator 动态赋值/统计喂给 GNN。
 
-性能（阶段 1+2）：
-1. ``atom_key``：对仍存活的 z3 AST 按 ``id(expr)`` 缓存 ``str(e)``（Python 对象 id，非
-   ``get_id()``——后者在 AST 回收后会复用，不能做全局键）。
-2. 固定 ``assertions`` 的静态结构 LRU 缓存；骨架钉住 assertion/原子引用以防 id 复用；
-   refocus 时只灌 assignment / search_state。``_linear`` 仅在冷建静态骨架时用局部缓存。
+注册策略（与建图分离）：
+- :func:`collect_atoms` —— 全部原子（建图 / look-ahead）；
+- :func:`collect_clause_atoms` —— 仅 CNF 析取子句（|lits|≥2）中的原子（``prop.add``）；
+- :func:`preprocess_assertions` / :func:`prepare_propagator_formula` —— 挂 prop 前轻量预处理。
+
+性能：``atom_key`` 按 ``id(expr)`` 缓存；静态 snapshot LRU；``_linear`` 仅单次建图局部缓存。
 """
 from __future__ import annotations
 
@@ -92,6 +91,10 @@ def _walk_atoms(e, out, seen):
 
 
 def collect_atoms(assertions) -> list:
+    """收集断言中全部布尔原子（比较原子 + Bool 常量），供建图 / look-ahead。
+
+    注意：UserPropagator **注册**请用 :func:`collect_clause_atoms`（仅析取子句原子）。
+    """
     out: list = []
     seen: set = set()
     dedup: dict = {}
@@ -107,8 +110,111 @@ def collect_atoms(assertions) -> list:
     return uniq
 
 
-def _clause_literals(assertion):
-    """把一个顶层 assertion 拉平成 (atom_key, is_positive) 列表（Or 展开，其余取自身原子）。"""
+def _iter_cnf_clauses(assertion):
+    """把断言按顶层 And 拆成子句根；非 And 则自身为一子句。"""
+    if z3.is_and(assertion):
+        for ch in assertion.children():
+            yield from _iter_cnf_clauses(ch)
+    else:
+        yield assertion
+
+
+def _clause_atom_exprs(clause) -> list:
+    """抽取一个子句中的原子 Expr（Or 展开；含单元子句的单原子）。"""
+    atoms: list = []
+    seen_ids: set[int] = set()
+
+    def add(e):
+        atom, _pos = _lit(e)
+        if _is_atom(atom):
+            eid = atom.get_id()
+            if eid not in seen_ids:
+                seen_ids.add(eid)
+                atoms.append(atom)
+            return
+        if z3.is_or(atom):
+            for ch in atom.children():
+                add(ch)
+            return
+        for ch in atom.children():
+            add(ch)
+
+    if z3.is_or(clause):
+        for ch in clause.children():
+            add(ch)
+    else:
+        add(clause)
+    return atoms
+
+
+def collect_clause_atoms(assertions) -> list:
+    """仅收集 **CNF 析取子句**（字面量数 ≥ 2）中的原子，供 ``prop.add`` 注册。
+
+    单元约束（盒界 ``x≥0``、单文字子句等）不注册——它们通常由理论传播决定，
+    不构成布尔分支决策点。嵌套 ``And`` 会先拆成子句再判断。
+    """
+    dedup: dict = {}
+    uniq: list = []
+    for a in assertions:
+        for clause in _iter_cnf_clauses(a):
+            atoms = _clause_atom_exprs(clause)
+            if len(atoms) < 2:
+                continue
+            for t in atoms:
+                k = atom_key(t)
+                if k not in dedup:
+                    dedup[k] = t
+                    uniq.append(t)
+    return uniq
+
+
+def preprocess_assertions(assertions) -> list:
+    """在**无** UserPropagator 的独立 Goal 上做轻量预处理，缩小后续原子集。
+
+    使用 ``simplify`` + ``propagate-values``（同 Context）。失败或结果为空时回退原断言。
+    调用方应在挂 propagator **之前**调用，并对返回列表求解 / 抽原子。
+    """
+    assertions = list(assertions)
+    if not assertions:
+        return []
+    ctx = assertions[0].ctx
+    try:
+        goal = z3.Goal(ctx=ctx)
+        goal.add(*assertions)
+        tactic = z3.Then(
+            z3.Tactic("simplify", ctx=ctx),
+            z3.Tactic("propagate-values", ctx=ctx),
+        )
+        result = tactic(goal)
+    except Exception as exc:
+        warnings.warn(f"preprocess_assertions 失败，回退原断言: {exc}")
+        return assertions
+
+    out: list = []
+    seen: set[int] = set()
+    for i in range(len(result)):
+        sub = result[i]
+        for j in range(len(sub)):
+            f = sub[j]
+            fid = f.get_id()
+            if fid in seen:
+                continue
+            seen.add(fid)
+            out.append(f)
+    return out if out else assertions
+
+
+def prepare_propagator_formula(assertions) -> tuple[list, list]:
+    """预处理断言并抽取应注册的析取子句原子。
+
+    返回 ``(预处理后断言, register_atoms)``；二者同 Context，供 Solver.add / prop.add。
+    """
+    pp = preprocess_assertions(assertions)
+    return pp, collect_clause_atoms(pp)
+
+
+def _clause_literals(clause):
+    """把一个子句拉平成 (atom_key, is_positive) 列表（Or 展开，其余取自身原子）。"""
     lits = []
     seen_ids: set[int] = set()  # 子句内用 get_id 去重（assertion 存活期间安全）
 
@@ -123,13 +229,12 @@ def _clause_literals(assertion):
             for ch in atom.children():
                 add(ch)
 
-    if z3.is_or(assertion):
-        for ch in assertion.children():
+    if z3.is_or(clause):
+        for ch in clause.children():
             add(ch)
     else:
-        add(assertion)
+        add(clause)
     return lits
-
 
 def _linear(e, cache: dict | None = None) -> tuple[dict, float]:
     """把线性算术表达式分解为 ``(变量名->系数, 常数)``；变量键用 ``atom_key``。
@@ -247,17 +352,19 @@ def _build_static(assertions) -> _StaticBoolSnapshot:
     pos = {k: 0 for k in amap}
     neg = {k: 0 for k in amap}
     clauses = []
-    for i, a in enumerate(assertions):
-        lits = [(k, p) for (k, p) in _clause_literals(a) if k in amap]
-        for k, p in lits:
-            occ[k] += 1
-            if p:
-                pos[k] += 1
-            else:
-                neg[k] += 1
-        if lits:
-            clauses.append(ClauseInfo(clause_id=f"c{i}", literals=lits))
-
+    ci = 0
+    for a in assertions:
+        for clause in _iter_cnf_clauses(a):
+            lits = [(k, p) for (k, p) in _clause_literals(clause) if k in amap]
+            for k, p in lits:
+                occ[k] += 1
+                if p:
+                    pos[k] += 1
+                else:
+                    neg[k] += 1
+            if lits:
+                clauses.append(ClauseInfo(clause_id=f"c{ci}", literals=lits))
+                ci += 1
     # 理论原子结构特征（LIA）：numeric_var -> theory_atom -> bool_var。
     # 纯 SAT 布尔常量被守卫跳过，theory_atoms / numeric_vars 保持为空。
     # _linear 局部缓存：仅本函数内有效，避免 get_id 复用脏读。
@@ -358,6 +465,9 @@ def build_bool_snapshot(assertions, assignment: Optional[dict] = None,
 __all__ = [
     "atom_key",
     "collect_atoms",
+    "collect_clause_atoms",
+    "preprocess_assertions",
+    "prepare_propagator_formula",
     "build_bool_snapshot",
     "clear_bool_snapshot_cache",
 ]

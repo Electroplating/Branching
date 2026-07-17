@@ -38,7 +38,13 @@ from omt_branching.solver.training_data import (
     baseline_numeric_choice, bool_branch_hit,
 )
 from omt_branching.solver.propagator_snapshot import (
-    atom_key, build_bool_snapshot, clear_bool_snapshot_cache, collect_atoms,
+    atom_key,
+    build_bool_snapshot,
+    clear_bool_snapshot_cache,
+    collect_atoms,
+    collect_clause_atoms,
+    prepare_propagator_formula,
+    preprocess_assertions,
 )
 from omt_branching.solver.propagator import LearnedDecidePropagator
 from omt_branching.solver.policy_decider import PolicyDecider, solve_with_learned_policy
@@ -123,6 +129,9 @@ __all__ = [
     # UserPropagator 学习分支（Phase 1）
     "atom_key",
     "collect_atoms",
+    "collect_clause_atoms",
+    "preprocess_assertions",
+    "prepare_propagator_formula",
     "build_bool_snapshot",
     "clear_bool_snapshot_cache",
     "LearnedDecidePropagator",
