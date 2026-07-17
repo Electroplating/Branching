@@ -38,10 +38,12 @@ def _policy_state_cpu(policy: BranchingPolicy) -> dict:
 
 def decide_rl_reward(res: dict, ref_val, ref_rlimit) -> float:
     """由 ``solve_omt_with_decider`` 返回值计算 REINFORCE 奖励。
-    若目标值不一致，说明迭代超过上限，惩罚设置为 -2.0
+    若目标值不一致或weighted未生成，说明迭代超过上限，惩罚设置为 -2.0
     否则根据weighted / ref 归一化给出 [-1, 1] 的奖励
     """
     if ref_val is not None and (res.get("value") is None or res["value"] != ref_val):
+        return -2.0
+    if res.get("weighted_rlimit") is None:
         return -2.0
     assert (ref_rlimit is not None) and ref_rlimit > 0
     ratio = min(1.0 * res.get("weighted_rlimit") / ref_rlimit, 2.0)
