@@ -1,9 +1,15 @@
-"""z3 二进制求解结果缓存。
+"""参考求解结果缓存（目录名 ``ref/``）。
 
-同一 ``.smt2`` 上 ``solve_binary`` 结果确定性，故按实例落盘后可反复复用（评测 / RL reward）。
-布局（相对数据集根目录）::
+同一 ``.smt2`` 上参考结果可反复复用（评测 / RL reward）。布局（相对数据集根目录）::
 
-    binary/<split>/<instance_id>.json
+    ref/<split>/<instance_id>.json
+
+缓存约定：
+
+- ``value``：始终来自 z3 **binary** 最优目标值；
+- ``rlimit``：RL / 剪枝用的参考资源——当 VSIDS 目标值与 binary 一致时取 VSIDS
+  的 ``rlimit``（否则回退 binary 的 ``rlimit``）；
+- ``binary`` / ``vsids``：两侧完整（或关键）统计，供三臂对比展示。
 
 并行求解时每实例独立文件，完成后立即写入，无共享锁。
 """
@@ -16,7 +22,19 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Optional
 
-BINARY_SUBDIR = "binary"
+REF_SUBDIR = "ref"
+# 旧名兼容（曾用 binary/）
+BINARY_SUBDIR = REF_SUBDIR
+
+
+def ref_result_path(
+    dataset_dir,
+    instance_id: str,
+    *,
+    split: str,
+) -> Path:
+    """返回某实例 ref 结果 JSON 路径。"""
+    return Path(dataset_dir) / REF_SUBDIR / split / f"{instance_id}.json"
 
 
 def binary_result_path(
@@ -25,12 +43,16 @@ def binary_result_path(
     *,
     split: str,
 ) -> Path:
-    """返回某实例 binary 结果 JSON 路径。"""
-    return Path(dataset_dir) / BINARY_SUBDIR / split / f"{instance_id}.json"
+    """``ref_result_path`` 的旧名别名。"""
+    return ref_result_path(dataset_dir, instance_id, split=split)
+
+
+def has_ref_result(dataset_dir, instance_id: str, *, split: str) -> bool:
+    return ref_result_path(dataset_dir, instance_id, split=split).is_file()
 
 
 def has_binary_result(dataset_dir, instance_id: str, *, split: str) -> bool:
-    return binary_result_path(dataset_dir, instance_id, split=split).is_file()
+    return has_ref_result(dataset_dir, instance_id, split=split)
 
 
 def _json_default(v: Any):
@@ -42,10 +64,12 @@ def _json_default(v: Any):
 
 
 def serialize_binary_result(result: dict) -> dict:
-    """把 ``solve_binary`` 返回值转为 JSON 可序列化 dict（保留全字段）。"""
+    """把求解结果 dict 转为 JSON 可序列化形式（保留全字段）。"""
     out: dict = {}
     for k, v in result.items():
-        if k == "z3_stats" and isinstance(v, dict):
+        if k in ("binary", "vsids") and isinstance(v, dict):
+            out[k] = serialize_binary_result(v)
+        elif k == "z3_stats" and isinstance(v, dict):
             out[k] = {sk: _json_default(sv) for sk, sv in v.items()}
         else:
             out[k] = _json_default(v)
@@ -64,11 +88,55 @@ def _parse_value(raw) -> Any:
 
 
 def deserialize_binary_result(payload: dict) -> dict:
-    """读回落盘结果：把 ``value`` 尽量还原为 ``Fraction``。"""
+    """读回落盘结果：把 ``value``（及嵌套 binary/vsids.value）尽量还原为 ``Fraction``。"""
     out = dict(payload)
     if "value" in out:
         out["value"] = _parse_value(out["value"])
+    for nest in ("binary", "vsids"):
+        nested = out.get(nest)
+        if isinstance(nested, dict) and "value" in nested:
+            nested = dict(nested)
+            nested["value"] = _parse_value(nested["value"])
+            out[nest] = nested
     return out
+
+
+def build_ref_payload(binary_result: dict, vsids_result: dict | None = None) -> dict:
+    """由 binary / VSIDS 结果构造缓存 payload。
+
+    - ``value`` ← binary
+    - ``rlimit`` ← VSIDS 的 ``rlimit``（目标值与 binary 一致时）否则 binary
+    """
+    bin_val = binary_result.get("value")
+    vsids = vsids_result or {}
+    vsids_val = vsids.get("value")
+    match = (
+        bin_val is not None
+        and vsids_val is not None
+        and vsids_val == bin_val
+    )
+    if match:
+        ref_rl = vsids.get("rlimit")
+        source = "vsids"
+    else:
+        ref_rl = binary_result.get("rlimit")
+        source = "binary"
+
+    payload = {
+        "value": bin_val,
+        "rlimit": ref_rl,
+        "rlimit_source": source,
+        "vsids_match": bool(match),
+        "binary_rlimit": binary_result.get("rlimit"),
+        "vsids_rlimit": vsids.get("rlimit"),
+        "status": binary_result.get("status"),
+        "time_ms": binary_result.get("time_ms"),
+        "conflicts": binary_result.get("conflicts"),
+        "decisions": binary_result.get("decisions"),
+        "binary": dict(binary_result),
+        "vsids": dict(vsids) if vsids else {},
+    }
+    return payload
 
 
 def save_binary_result(
@@ -78,8 +146,8 @@ def save_binary_result(
     *,
     split: str,
 ) -> Path:
-    """立刻把结果写入磁盘（先写临时文件再 rename，避免半截 JSON）。"""
-    path = binary_result_path(dataset_dir, instance_id, split=split)
+    """立刻把结果写入 ``ref/``（先写临时文件再 rename，避免半截 JSON）。"""
+    path = ref_result_path(dataset_dir, instance_id, split=split)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = serialize_binary_result(result)
     payload.setdefault("instance_id", instance_id)
@@ -99,12 +167,20 @@ def load_binary_result(
     *,
     split: str,
 ) -> Optional[dict]:
-    """加载单实例结果；不存在返回 ``None``。"""
-    path = binary_result_path(dataset_dir, instance_id, split=split)
+    """加载单实例 ref 结果；不存在返回 ``None``。"""
+    path = ref_result_path(dataset_dir, instance_id, split=split)
     if not path.is_file():
         return None
     with open(path, encoding="utf-8") as f:
         return deserialize_binary_result(json.load(f))
+
+
+def binary_stats_from_ref(ref: dict) -> dict:
+    """三臂对比用：取出缓存中的 binary 原始统计。"""
+    nested = ref.get("binary")
+    if isinstance(nested, dict) and nested:
+        return nested
+    return ref
 
 
 def binary_rlimit(
@@ -113,7 +189,7 @@ def binary_rlimit(
     *,
     split: str,
 ) -> Optional[int]:
-    """RL reward 用：返回缓存的 ``rlimit``（无结果或超时则为 ``None``）。"""
+    """RL reward 用：返回缓存的参考 ``rlimit``（VSIDS 优先，见模块文档）。"""
     res = load_binary_result(dataset_dir, instance_id, split=split)
     if res is None:
         return None
@@ -127,7 +203,7 @@ def binary_value(
     *,
     split: str,
 ):
-    """RL / match 用：返回缓存的最优 ``value``（``Fraction`` 或 ``None``）。"""
+    """RL / match 用：返回缓存的最优 ``value``（始终来自 binary）。"""
     res = load_binary_result(dataset_dir, instance_id, split=split)
     if res is None:
         return None
@@ -139,11 +215,11 @@ def load_binary_results(
     *,
     split: str | None = None,
 ) -> dict[str, dict]:
-    """批量加载 ``binary/`` 下结果，键为 ``instance_id``。
+    """批量加载 ``ref/`` 下结果，键为 ``instance_id``。
 
     ``split`` 为 ``None`` 时扫描所有划分；同 id 后写覆盖先写（通常各 split id 不冲突）。
     """
-    root = Path(dataset_dir) / BINARY_SUBDIR
+    root = Path(dataset_dir) / REF_SUBDIR
     if not root.is_dir():
         return {}
     splits = [split] if split is not None else sorted(
@@ -168,23 +244,28 @@ def missing_binary_ids(
     *,
     split: str,
 ) -> list[str]:
-    """给出 manifest 条目中尚未有 binary 结果的 ``instance_id`` 列表。"""
+    """给出 manifest 条目中尚未有 ref 结果的 ``instance_id`` 列表。"""
     missing: list[str] = []
     for e in entries:
         iid = e["instance_id"]
-        if not has_binary_result(dataset_dir, iid, split=split):
+        if not has_ref_result(dataset_dir, iid, split=split):
             missing.append(iid)
     return missing
 
 
 __all__ = [
+    "REF_SUBDIR",
     "BINARY_SUBDIR",
+    "ref_result_path",
     "binary_result_path",
+    "has_ref_result",
     "has_binary_result",
     "serialize_binary_result",
     "deserialize_binary_result",
+    "build_ref_payload",
     "save_binary_result",
     "load_binary_result",
+    "binary_stats_from_ref",
     "binary_rlimit",
     "binary_value",
     "load_binary_results",

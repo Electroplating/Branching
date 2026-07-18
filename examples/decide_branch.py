@@ -1,11 +1,12 @@
 """三臂对比：z3 二进制参考 / VSIDS-decide / learned-decide。
 
-以 ``examples/artifacts/dataset`` 中缓存的 ``solve_binary`` 结果为参考最优值，测量
+以 ``examples/artifacts/dataset`` 中 ``ref/`` 缓存为参考：最优 ``value`` 来自 binary；
+RL 用 ``rlimit`` 在 VSIDS 命中同一最优时取 VSIDS，否则取 binary。测量
 VSIDS/learned 相对参考的正确性（match）与 rlimit/conflicts/decisions。
 
 数据集须事先由 ``python -m examples.generate_dataset`` 生成；本脚本只检查/重建
-``manifest.json``，不生成实例。binary 参考解须由
-``python -m examples.solve_dataset_binary`` 写入 ``binary/<split>/<id>.json``。
+``manifest.json``，不生成实例。参考缓存须由
+``python -m examples.solve_dataset_binary`` 写入 ``ref/<split>/<id>.json``。
 
 RL 微调默认在 ``eval/`` 验证集上按 ``mean_reward`` 早停：``--rl-iters N`` 最多 N 轮
 （收敛可提前结束）；``--rl-iters -1`` 训到收敛为止。验证集可用::
@@ -48,6 +49,7 @@ from omt_branching.solver import (
 )
 from omt_branching.solver.binary_results import (
     binary_rlimit,
+    binary_stats_from_ref,
     binary_value,
     load_binary_result,
     missing_binary_ids,
@@ -113,18 +115,18 @@ def _require_binary_cache(dataset_dir: str, split: str, entries: list[dict]) -> 
         preview = ", ".join(missing[:5])
         more = f" 等共 {len(missing)} 个" if len(missing) > 5 else ""
         raise SystemExit(
-            f"划分 {split} 缺少 binary 缓存（如 {preview}{more}）。\n"
+            f"划分 {split} 缺少 ref 缓存（如 {preview}{more}）。\n"
             f"请先运行: python -m examples.solve_dataset_binary "
             f"--dataset-dir {dataset_dir}"
         )
 
 
 def _eval_test_worker(task: tuple) -> dict:
-    """ProcessPool worker：从 .smt2 加载实例，binary 用缓存，跑 VSIDS/learned。"""
+    """ProcessPool worker：从 .smt2 加载实例，ref 缓存取最优值，跑 VSIDS/learned。"""
     (
         smt2_path,
         instance_id,
-        binary_result,
+        ref_cache,
         policy_state,
         device,
         refocus,
@@ -133,8 +135,8 @@ def _eval_test_worker(task: tuple) -> dict:
 
     inst = smt2_to_instance(smt2_path, instance_id=instance_id)
     hard, obj, sense = inst.as_tuple()
-    ref = binary_result
-    ref_val = ref.get("value")
+    ref_val = ref_cache.get("value")
+    bin_stats = binary_stats_from_ref(ref_cache)
     v = solve_omt_with_decider(hard, obj, sense, decider_factory=None)
     policy = BranchingPolicy()
     policy.load_state_dict(policy_state)
@@ -153,7 +155,7 @@ def _eval_test_worker(task: tuple) -> dict:
     return {
         "instance_id": inst.instance_id,
         "ref_val": ref_val,
-        "binary": ref,
+        "binary": bin_stats,
         "vsids": v,
         "learned": ln,
     }
@@ -225,7 +227,7 @@ def _run_test_parallel(
         iid = e["instance_id"]
         cached = load_binary_result(dataset_dir, iid, split=split)
         if cached is None:
-            raise RuntimeError(f"缺少 binary 缓存 ({split}): {iid}")
+            raise RuntimeError(f"缺少 ref 缓存 ({split}): {iid}")
         tasks.append((
             str(root / e["smt2"]),
             iid,
@@ -267,7 +269,7 @@ def _run_val_parallel(
         iid = e["instance_id"]
         cached = load_binary_result(dataset_dir, iid, split=split)
         if cached is None:
-            raise RuntimeError(f"缺少 binary 缓存 ({split}): {iid}")
+            raise RuntimeError(f"缺少 ref 缓存 ({split}): {iid}")
         tasks.append((
             str(root / e["smt2"]),
             iid,
@@ -475,7 +477,7 @@ def main() -> None:
             preview = ", ".join(missing[:5])
             more = f" 等共 {len(missing)} 个" if len(missing) > 5 else ""
             raise SystemExit(
-                f"RL 需要 train 划分的 binary 缓存（缺 {preview}{more}）。\n"
+                f"RL 需要 train 划分的 ref 缓存（缺 {preview}{more}）。\n"
                 f"请先运行: python -m examples.solve_dataset_binary "
                 f"--dataset-dir {dataset_dir} --split train"
             )
@@ -507,7 +509,7 @@ def main() -> None:
         print(
             f"RL collect: {len(rl_train)} 实例 × {iters_desc}, {mode} "
             f"(请求 workers={args.rl_workers})；collect 用 CPU，update 用 {device}；"
-            f"reward 使用 binary ref_value/ref_rlimit"
+            f"reward 使用 ref/ 缓存（value←binary；rlimit←vsids 若命中最优）"
         )
         print(f"RL checkpoints -> {args.ckpt_dir}/ (every {args.ckpt_every})")
 
@@ -664,8 +666,8 @@ def main() -> None:
 
     n = max(1, len(insts))
     print(
-        f"=== 三臂对比（{len(insts)} 实例；binary 为缓存参考；"
-        f"match=1 为与 binary 最优值一致）==="
+        f"=== 三臂对比（{len(insts)} 实例；最优 value 来自 ref/binary；"
+        f"match=1 为与该最优值一致）==="
     )
     for key in agg["binary"].keys():
         agg["binary"][key] /= n
@@ -676,7 +678,7 @@ def main() -> None:
 
     os.makedirs(ARTIFACTS, exist_ok=True)
     results = {
-        "reference": "binary_cache",
+        "reference": "ref_cache",
         "dataset_dir": dataset_dir,
         "summary": agg,
         "n_instances": len(insts),

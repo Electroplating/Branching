@@ -78,7 +78,7 @@ def _append_eval(args) -> None:
         json.dump(manifest, f, indent=4, ensure_ascii=False)
     print(f"manifest 已更新 -> {manifest_path}")
     print(
-        "下一步（binary 缓存 eval）:\n"
+        "下一步（ref 缓存 eval）:\n"
         f"  python -m examples.solve_dataset_binary --dataset-dir {args.dataset_dir} "
         f"--split eval"
     )
@@ -187,7 +187,7 @@ def main() -> None:
         json.dump(manifest, f, indent=4, ensure_ascii=False)
     print(f"manifest -> {manifest_path}")
     print(
-        "下一步（binary 缓存）:\n"
+        "下一步（ref 缓存）:\n"
         f"  python -m examples.solve_dataset_binary --dataset-dir {args.dataset_dir}"
     )
 

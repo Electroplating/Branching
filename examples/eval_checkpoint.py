@@ -1,6 +1,6 @@
 """加载已有策略权重，在数据集 test 划分上做三臂对比并写 ``results.json``。
 
-评测逻辑与 ``examples/decide_branch.py`` 一致（``PolicyDecider`` + binary 缓存参考），
+评测逻辑与 ``examples/decide_branch.py`` 一致（``PolicyDecider`` + ref 缓存参考），
 不训练。默认权重 ``examples/artifacts/rl_decide_policy.pt``，默认数据
 ``examples/artifacts/dataset``。
 
@@ -172,8 +172,8 @@ def main() -> None:
 
     n = max(1, len(insts))
     print(
-        f"=== 三臂对比（{len(insts)} 实例；binary 为缓存参考；"
-        f"match=1 为与 binary 最优值一致）==="
+        f"=== 三臂对比（{len(insts)} 实例；最优 value 来自 ref/binary；"
+        f"match=1 为与该最优值一致）==="
     )
     for key in agg["binary"].keys():
         agg["binary"][key] /= n
@@ -189,7 +189,7 @@ def main() -> None:
           f"weighted_rlimit={agg['learned'].get('weighted rlimit', 0):.1f}")
 
     results = {
-        "reference": "binary_cache",
+        "reference": "ref_cache",
         "dataset_dir": dataset_dir,
         "summary": agg,
         "n_instances": len(insts),
