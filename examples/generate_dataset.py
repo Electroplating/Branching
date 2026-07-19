@@ -9,6 +9,11 @@
     python -m examples.generate_dataset --hard --force
     # 向已有数据集额外生成 / 覆盖验证集（不改动 train/test）:
     python -m examples.generate_dataset --append-eval --eval 10 --min-vars 4 --max-vars 5
+
+分支敏感实例（CSL≈VSIDS 且 oracle 可显著降 rlimit）请用探针筛选落盘::
+
+    python -m examples.probe_branch_focus --candidates 40 --need 10 --save
+    python -m examples.probe_branch_focus --seed 100 --split train --save
 """
 
 from __future__ import annotations

@@ -556,6 +556,8 @@ def manifest_mismatches(dataset_dir) -> list[str]:
 
 def _infer_family_description(instance_id: str) -> tuple[str, str]:
     """无旧标签时，按 id 前缀猜测 family/description。"""
+    if instance_id.startswith("bfocus"):
+        return "branch_focus", "branch-focus LIA (imported)"
     if instance_id.startswith("hblia"):
         return "bool", "hard bool LIA (imported)"
     if instance_id.startswith("blia"):
