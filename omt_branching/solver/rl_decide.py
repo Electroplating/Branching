@@ -330,6 +330,10 @@ def _rl_collect_worker(task: tuple) -> tuple:
         ref_rlimit=ref_rlimit,
         sample=True,
     )
+    # solve_omt_with_decider 不回传参考字段；写入 history / match 前补上。
+    res = dict(res)
+    res["ref_value"] = ref_value
+    res["ref_rlimit"] = ref_rlimit
     steps = holder["d"].steps if "d" in holder else []
     reward = decide_rl_reward(res, ref_value, ref_rlimit)
     return inst_idx, _steps_to_cpu(steps), reward, res
@@ -390,6 +394,10 @@ class DecideRLTrainer:
             ref_rlimit=ref_rlimit,
             sample=True,
         )
+        # solve_omt_with_decider 不回传参考字段；写入 history / match 前补上。
+        res = dict(res)
+        res["ref_value"] = ref_value
+        res["ref_rlimit"] = ref_rlimit
         steps = holder["d"].steps if "d" in holder else []
         reward = decide_rl_reward(res, ref_value, ref_rlimit)
         return steps, reward, res
