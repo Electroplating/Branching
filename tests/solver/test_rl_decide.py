@@ -46,6 +46,27 @@ def test_sampling_decider_sticky_reuses_scores_without_resample():
     assert o2 == o1 and o3 == o1
 
 
+def test_sampling_decider_backtrack_forces_new_window():
+    """on_backtrack 清空粘性窗，下次 decide 重新 refocus 并记新 step。"""
+    x = z3.Int("x")
+    a, b = x >= 5, x <= 2
+    asserts = [x >= 0, x <= 10, z3.Or(a, b)]
+    policy = BranchingPolicy()
+    defer = torch.tensor(-10.0)
+    dec = SamplingPolicyDecider(
+        policy, defer, asserts, refocus_every=100, sample=True, sticky_window=True
+    )
+    und = [atom_key(a), atom_key(b)]
+    torch.manual_seed(2)
+    _ = dec(und, {})
+    assert len(dec.steps) == 1
+    dec.on_backtrack(1)
+    assert dec._since == dec.refocus_every
+    assert dec._graph is None
+    _ = dec(und, {})
+    assert len(dec.steps) == 2
+
+
 def test_sampling_decider_nonsticky_records_every_call():
     x = z3.Int("x")
     a, b = x >= 5, x <= 2

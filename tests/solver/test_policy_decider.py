@@ -53,3 +53,38 @@ def test_add_hard_appends_and_forces_refocus():
     assert dec.assertions[-1] is cut
     assert dec._since == dec.refocus_every
     assert dec._pri is None
+
+
+def test_on_backtrack_forces_immediate_refocus():
+    x = z3.Int("x")
+    asserts = [x >= 0, x <= 10, z3.Or(x >= 5, x <= 2)]
+    svc = BranchingPolicyService(policy=BranchingPolicy())
+    dec = PolicyDecider(svc, asserts, refocus_every=100)
+    calls = {"n": 0}
+    orig = dec._refocus
+
+    def counting(asg):
+        calls["n"] += 1
+        return orig(asg)
+
+    dec._refocus = counting
+    dec([atom_key(x >= 5)], {})  # 首次 refocus
+    assert calls["n"] == 1
+    assert dec._since == 1
+    dec.on_backtrack(1)
+    assert dec._since == dec.refocus_every
+    dec([atom_key(x >= 5)], {})  # 回退后立刻再 refocus
+    assert calls["n"] == 2
+
+
+def test_on_backtrack_can_be_disabled():
+    x = z3.Int("x")
+    asserts = [x >= 0, x <= 10, z3.Or(x >= 5, x <= 2)]
+    svc = BranchingPolicyService(policy=BranchingPolicy())
+    dec = PolicyDecider(
+        svc, asserts, refocus_every=100, refocus_on_backtrack=False
+    )
+    dec([atom_key(x >= 5)], {})
+    assert dec._since == 1
+    dec.on_backtrack(2)
+    assert dec._since == 1

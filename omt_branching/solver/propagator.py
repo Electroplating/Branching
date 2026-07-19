@@ -39,6 +39,10 @@ class LearnedDecidePropagator(z3.UserPropagateBase):
             lim = self._lim.pop()
             while len(self._trail) > lim:
                 self._val.pop(self._trail.pop(), None)
+        # 冲突回退（及任意 scope pop）后通知 decider：下次 decide 立刻 refocus。
+        on_bt = getattr(self.decider, "on_backtrack", None)
+        if callable(on_bt):
+            on_bt(num_scopes)
 
     def fresh(self, new_ctx):
         return LearnedDecidePropagator(new_ctx, self.atoms, self.decider)

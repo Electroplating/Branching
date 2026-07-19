@@ -5,6 +5,9 @@ GNN，对 ``[defer, 当时未定原子]`` 采样一次并记一条 REINFORCE ste
 不再采样/进 torch——defer 则整窗放行 VSIDS，否则粘性返回采样原子，已定后按缓存分数贪心。
 
 ``sticky_window=False`` 恢复旧行为（每次 decide 都采样并记 step）。
+
+冲突回退（propagator ``pop`` → :meth:`SamplingPolicyDecider.on_backtrack`，默认开启）
+会清空粘性窗并强制下次 decide 立刻 refocus。
 """
 
 from __future__ import annotations
@@ -93,6 +96,7 @@ class SamplingPolicyDecider:
         device: str | torch.device = "cpu",
         *,
         sticky_window: bool = True,
+        refocus_on_backtrack: bool = True,
     ):
         self.policy = policy
         self.defer_logit = defer_logit  # torch 标量（trainer 持有的可学参数）
@@ -102,6 +106,7 @@ class SamplingPolicyDecider:
         self.sample = sample
         # True：每窗只采样/记 step 一次，其后按缓存分数立即返回（训练默认）
         self.sticky_window = sticky_window
+        self.refocus_on_backtrack = refocus_on_backtrack
         self._graph = None
         self._scores = None  # detached bool_branch_scores（CPU）
         self._phases = None  # detached phase_logits（CPU），>0 → True
@@ -114,11 +119,8 @@ class SamplingPolicyDecider:
         self._since = self.refocus_every
         self.steps: list = []
 
-    def add_hard(self, *exprs) -> None:
-        """把新增硬约束（如 OMT better-cut）并入建图断言，并强制下次 decide refocus。"""
-        if not exprs:
-            return
-        self.assertions.extend(exprs)
+    def force_refocus(self) -> None:
+        """清空图/分数/粘性窗，使下次 decide 立刻跑 GNN。"""
         self._graph = None
         self._scores = None
         self._phases = None
@@ -130,6 +132,17 @@ class SamplingPolicyDecider:
         self._window_phase = True
         self._since = self.refocus_every
 
+    def add_hard(self, *exprs) -> None:
+        """把新增硬约束（如 OMT better-cut）并入建图断言，并强制下次 decide refocus。"""
+        if not exprs:
+            return
+        self.assertions.extend(exprs)
+        self.force_refocus()
+
+    def on_backtrack(self, num_scopes: int = 1) -> None:
+        """propagator ``pop`` 回调：冲突回退后强制下次 decide refocus。"""
+        if self.refocus_on_backtrack:
+            self.force_refocus()
     def _undecided_pairs(self, undecided_keys):
         if self._scores is None or self._scores.numel() == 0:
             return [], []
