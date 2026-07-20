@@ -130,14 +130,19 @@ def test_decide_rl_sat_collect_update():
 
 
 def test_decide_rl_parallel_collect():
-    """多进程 collect + 主进程 update。"""
+    """多线程 collect + GpuInferPool 排队推理 + 主线程 update。"""
     from omt_branching.solver import generate_bool_lia_dataset
     from omt_branching.solver.rl_decide import DecideRLTrainer, DecideRLConfig
 
     insts = generate_bool_lia_dataset(8, seed=2, min_vars=5, max_vars=5)
     tr = DecideRLTrainer(
         BranchingPolicy(),
-        DecideRLConfig(refocus_every=40, workers=2, min_instances_for_parallel=4),
+        DecideRLConfig(
+            refocus_every=40,
+            workers=2,
+            min_instances_for_parallel=4,
+            use_all_gpus=False,
+        ),
     )
     hist = tr.train(
         [i.as_tuple() for i in insts],
@@ -147,5 +152,40 @@ def test_decide_rl_parallel_collect():
         collect_min_vars=5,
         collect_max_vars=5,
     )
-    assert len(hist) == 8
-    assert all(h["steps"] >= 0 for h in hist)
+    # train_end 汇总一条
+    assert len(hist) == 9
+    assert all(h.get("steps", 0) >= 0 for h in hist if "steps" in h)
+    assert tr._infer_pool is not None
+    assert len(tr._infer_pool.devices) >= 1
+
+
+def test_gpu_infer_pool_queues_slots():
+    """空闲槽排队：单设备上两次 infer 均可完成。"""
+    from omt_branching.solver.rl_decide import GpuInferPool
+    from omt_branching.input.graph_builder import GraphBuilder
+    from omt_branching.input.solver_state import (
+        BooleanVarInfo,
+        ClauseInfo,
+        ObjectiveInfo,
+        SearchStateInfo,
+        SolverSnapshot,
+    )
+
+    policy = BranchingPolicy()
+    pool = GpuInferPool.from_policy(policy, device="cpu", use_all_gpus=False)
+    snap = SolverSnapshot(
+        bool_vars=[
+            BooleanVarInfo(var_id="a", is_candidate=True),
+            BooleanVarInfo(var_id="b", is_candidate=True),
+        ],
+        clauses=[ClauseInfo(clause_id="c0", literals=[("a", True), ("b", False)])],
+        objective=ObjectiveInfo(objective_id="obj"),
+        search_state=SearchStateInfo(),
+        candidate_bool_ids=["a", "b"],
+    )
+    g = GraphBuilder().build(snap)
+    s1, p1 = pool.infer(g)
+    s2, p2 = pool.infer(g)
+    assert s1.shape == s2.shape == (2,)
+    assert p1.shape == p2.shape == (2,)
+

@@ -364,7 +364,7 @@ def main() -> None:
         "--rl-workers",
         type=int,
         default=DEFAULT_RL_COLLECT_WORKERS,
-        help="RL collect 进程数（默认 4；实例数<8 时自动串行；与 --test-workers 独立）",
+        help="RL collect 线程数（默认 4；实例数<8 时自动串行；GNN 排队用全部 GPU；与 --test-workers 独立）",
     )
     ap.add_argument(
         "--ckpt-dir",
@@ -523,7 +523,11 @@ def main() -> None:
                 workers=rl_workers,
             ),
         )
-        mode = f"并行×{rl_workers}" if rl_workers > 1 else "串行(GPU collect)"
+        mode = (
+            f"线程并行×{rl_workers}（GNN 排队全 GPU）"
+            if rl_workers > 1
+            else "串行 collect"
+        )
         iters_desc = (
             "直到收敛"
             if args.rl_iters == -1
@@ -531,7 +535,7 @@ def main() -> None:
         )
         print(
             f"RL collect: {len(rl_train)} 实例 × {iters_desc}, {mode} "
-            f"(请求 workers={args.rl_workers})；collect 用 CPU，update 用 {device}；"
+            f"(请求 workers={args.rl_workers})；update 设备={device}；"
             f"reward 使用 ref/ 缓存（value←binary；rlimit←公平 vsids 若命中最优）"
         )
         print(f"RL checkpoints -> {args.ckpt_dir}/ (every {args.ckpt_every})")

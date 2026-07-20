@@ -8,20 +8,26 @@ GNN，对 ``[defer, 当时未定原子]`` 采样一次并记一条 REINFORCE ste
 
 冲突回退（propagator ``pop`` → :meth:`SamplingPolicyDecider.on_backtrack`，默认开启）
 会清空粘性窗并强制下次 decide 立刻 refocus。
+
+**并行 collect**（``workers>1``）：同进程 ``ThreadPoolExecutor`` 并行跑 z3；
+:class:`GpuInferPool` 在线程间排队占用全部 GPU 做 ``infer``（无进程间通信）。
+``solve_omt_with_decider`` 默认独立 ``z3.Context``，可与多线程并用。
 """
 
 from __future__ import annotations
 
 import math
-import multiprocessing as mp
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import torch
 
-from omt_branching.model.device import gnn_device
+from omt_branching.graph.hetero_graph import HeteroGraph
+from omt_branching.model.device import gnn_device, resolve_infer_devices
 from omt_branching.input.graph_builder import DEFAULT_FEATURE_SPEC, GraphBuilder
 from omt_branching.interfaces import NodeType
 from omt_branching.model.policy import BranchingPolicy
@@ -37,10 +43,6 @@ from tqdm import tqdm
 
 DEFAULT_RL_COLLECT_WORKERS = 4
 MIN_INSTANCES_FOR_RL_PARALLEL = 8
-
-
-def _policy_state_cpu(policy: BranchingPolicy) -> dict:
-    return {k: v.detach().cpu() for k, v in policy.state_dict().items()}
 
 
 def decide_rl_reward(res: dict, ref_val, ref_rlimit) -> float:
@@ -73,22 +75,70 @@ def effective_rl_workers(
     *,
     min_instances: int = MIN_INSTANCES_FOR_RL_PARALLEL,
 ) -> int:
-    """小批量或 requested<=1 时退回串行，避免进程启动开销超过 z3 收益。"""
+    """小批量或 requested<=1 时退回串行，避免线程调度开销超过 z3 收益。"""
     if requested <= 1 or count < min_instances:
         return 1
     cpus = os.cpu_count() or 1
     return max(1, min(requested, count, cpus))
 
 
-def _steps_to_cpu(steps) -> list:
-    """进程间回传前把图张量落到 CPU。"""
-    out = []
-    for g, locs, idx in steps:
-        if g.node_features:
-            dev = next(iter(g.node_features.values())).device
-            g = g.to("cpu") if dev.type != "cpu" else g
-        out.append((g, locs, idx))
-    return out
+def _clone_policy(policy: BranchingPolicy, device: str) -> BranchingPolicy:
+    """复制架构与权重到 ``device``，供推理副本使用。"""
+    spec = getattr(policy.encoder, "spec", DEFAULT_FEATURE_SPEC)
+    replica = BranchingPolicy(feature_spec=spec, config=policy.config)
+    replica.load_state_dict(policy.state_dict())
+    return replica.to(device).eval()
+
+
+class GpuInferPool:
+    """同进程多设备排队推理：线程安全、无 IPC。
+
+    空闲设备索引放在 ``queue.Queue`` 中；线程 ``get`` 占用一张卡做 ``infer``，
+    ``finally`` 归还。多卡时可并行占用不同 GPU，同卡请求自动串行。
+    """
+
+    def __init__(self, policy: BranchingPolicy, devices: list[str]):
+        if not devices:
+            raise ValueError("GpuInferPool 需要至少一个 device")
+        self.devices = list(devices)
+        self._replicas = [_clone_policy(policy, d) for d in self.devices]
+        self._free: queue.Queue[int] = queue.Queue()
+        for i in range(len(self.devices)):
+            self._free.put(i)
+        self._sync_lock = threading.Lock()
+
+    @classmethod
+    def from_policy(
+        cls,
+        policy: BranchingPolicy,
+        *,
+        device: str = "cpu",
+        use_all_gpus: bool = True,
+    ) -> "GpuInferPool":
+        return cls(policy, resolve_infer_devices(device, use_all_gpus=use_all_gpus))
+
+    def sync_from(self, policy: BranchingPolicy) -> None:
+        """从训练用策略刷新全部推理副本权重（collect 批次前调用）。"""
+        state = policy.state_dict()
+        with self._sync_lock:
+            for rep in self._replicas:
+                rep.load_state_dict(state)
+                rep.eval()
+
+    def infer(self, g: HeteroGraph) -> tuple[torch.Tensor, torch.Tensor]:
+        """在空闲 GPU/CPU 上推理；返回 CPU 上的 ``(bool_scores, phase_logits)``。"""
+        slot = self._free.get()
+        try:
+            rep = self._replicas[slot]
+            dev = self.devices[slot]
+            g_dev = g.copy_to(dev)
+            with torch.inference_mode():
+                out = rep.infer(g_dev)
+            scores = out.bool_branch_scores.detach().cpu()
+            phases = out.phase_logits.detach().cpu()
+            return scores, phases
+        finally:
+            self._free.put(slot)
 
 
 class SamplingPolicyDecider:
@@ -103,10 +153,12 @@ class SamplingPolicyDecider:
         *,
         sticky_window: bool = True,
         refocus_on_backtrack: bool = True,
+        infer_pool: GpuInferPool | None = None,
     ):
         self.policy = policy
         self.defer_logit = defer_logit  # torch 标量（trainer 持有的可学参数）
         self.device = device
+        self.infer_pool = infer_pool
         self.assertions = list(assertions)
         self.refocus_every = max(1, refocus_every)
         self.sample = sample
@@ -226,13 +278,16 @@ class SamplingPolicyDecider:
     def _refocus(self, assignment) -> None:
         asg = merge_root_assignment(self._root_fixed, assignment)
         snap, _ = build_bool_snapshot(self.assertions, assignment=asg)
+        # 建图始终在 CPU；steps 存 CPU 图，update 时再搬到训练设备
         g = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
-        g = g.to(self.device)
-        out = self.policy.infer(g)
+        if self.infer_pool is not None:
+            self._scores, self._phases = self.infer_pool.infer(g)
+        else:
+            g_dev = g.copy_to(self.device)
+            out = self.policy.infer(g_dev)
+            self._scores = out.bool_branch_scores.detach().cpu()
+            self._phases = out.phase_logits.detach().cpu()
         self._graph = g
-        # z3 回调内用 CPU 分数，避免 GPU .item() 同步
-        self._scores = out.bool_branch_scores.detach().cpu()
-        self._phases = out.phase_logits.detach().cpu()
         self._bmap = g.id_maps.get(NodeType.BOOL_VAR, {})
         self._rebuild_key_tables()
 
@@ -289,6 +344,8 @@ class DecideRLConfig:
     device: str = field(default_factory=gnn_device)
     workers: int = 1
     min_instances_for_parallel: int = MIN_INSTANCES_FOR_RL_PARALLEL
+    #: 并行 collect 时是否把全部 CUDA 设备纳入 :class:`GpuInferPool`
+    use_all_gpus: bool = True
 
 
 @dataclass
@@ -308,80 +365,6 @@ class EarlyStopConfig:
     eval_every: int = 1
 
 
-def _make_rl_process_pool(workers: int) -> ProcessPoolExecutor:
-    """Linux 上必须用 spawn：父进程已 init CUDA 时 fork 会导致子进程卡死。"""
-    ctx = mp.get_context("spawn")
-    return ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
-
-
-def _rl_collect_worker(task: tuple) -> tuple:
-    """ProcessPool worker：从 smt2 或按 index/seed 重建实例并 collect。"""
-    (
-        inst_idx,
-        seed,
-        hard,
-        min_vars,
-        max_vars,
-        policy_state,
-        defer_val,
-        refocus_every,
-        max_iters,
-        device,
-        smt2_path,
-        instance_id,
-        ref_value,
-        ref_rlimit,
-    ) = task
-    if smt2_path:
-        from omt_branching.solver.decide_omt import smt2_to_instance
-
-        inst = smt2_to_instance(smt2_path, instance_id=instance_id)
-    else:
-        from omt_branching.solver.instance_gen import bool_lia_instance_at
-
-        inst = bool_lia_instance_at(
-            inst_idx, seed, hard=hard, min_vars=min_vars, max_vars=max_vars
-        )
-    hard_exprs, obj, sense = inst.as_tuple()
-
-    policy = BranchingPolicy()
-    policy.load_state_dict(policy_state)
-    policy.to(device)
-    policy.eval()
-    defer = torch.nn.Parameter(torch.tensor(defer_val, dtype=torch.float32))
-
-    holder: dict = {}
-
-    def factory(assertions):
-        d = SamplingPolicyDecider(
-            policy,
-            defer,
-            assertions,
-            refocus_every,
-            sample=True,
-            device=device,
-        )
-        holder["d"] = d
-        return d
-
-    res = solve_omt_with_decider(
-        hard_exprs,
-        obj,
-        sense,
-        decider_factory=factory,
-        max_iters=max_iters,
-        ref_rlimit=ref_rlimit,
-        sample=True,
-    )
-    # solve_omt_with_decider 不回传参考字段；写入 history / match 前补上。
-    res = dict(res)
-    res["ref_value"] = ref_value
-    res["ref_rlimit"] = ref_rlimit
-    steps = holder["d"].steps if "d" in holder else []
-    reward = decide_rl_reward(res, ref_value, ref_rlimit)
-    return inst_idx, _steps_to_cpu(steps), reward, res
-
-
 class DecideRLTrainer:
     def __init__(
         self, policy: BranchingPolicy, config: DecideRLConfig = DecideRLConfig()
@@ -394,6 +377,16 @@ class DecideRLTrainer:
         )
         self._baselines: dict = {}
         self._baseline = 0.0
+        self._infer_pool: GpuInferPool | None = None
+
+    def _ensure_infer_pool(self) -> GpuInferPool:
+        if self._infer_pool is None:
+            self._infer_pool = GpuInferPool.from_policy(
+                self.policy,
+                device=self.config.device,
+                use_all_gpus=self.config.use_all_gpus,
+            )
+        return self._infer_pool
 
     def _baseline_for(self, key):
         return self._baselines.get(key, self._baseline)
@@ -413,8 +406,10 @@ class DecideRLTrainer:
         *,
         ref_value=None,
         ref_rlimit: int | None = None,
+        infer_pool: GpuInferPool | None = None,
     ):
         holder: dict = {}
+        pool = infer_pool
 
         def factory(assertions):
             d = SamplingPolicyDecider(
@@ -424,6 +419,7 @@ class DecideRLTrainer:
                 self.config.refocus_every,
                 sample=True,
                 device=self.config.device,
+                infer_pool=pool,
             )
             holder["d"] = d
             return d
@@ -445,6 +441,69 @@ class DecideRLTrainer:
         reward = decide_rl_reward(res, ref_value, ref_rlimit)
         return steps, reward, res
 
+    def _load_collect_instance(
+        self,
+        inst_idx: int,
+        *,
+        seed: int,
+        hard: bool,
+        min_vars: int,
+        max_vars: int,
+        smt2_path: str | None,
+        instance_id: str | None,
+        instances: list | None,
+    ):
+        """线程内加载单实例 ``(hard, obj, sense)``。"""
+        if smt2_path:
+            from omt_branching.solver.decide_omt import smt2_to_instance
+
+            inst = smt2_to_instance(smt2_path, instance_id=instance_id)
+            return inst.as_tuple()
+        if instances is not None:
+            return instances[inst_idx]
+        from omt_branching.solver.instance_gen import bool_lia_instance_at
+
+        inst = bool_lia_instance_at(
+            inst_idx, seed, hard=hard, min_vars=min_vars, max_vars=max_vars
+        )
+        return inst.as_tuple()
+
+    def _collect_one(
+        self,
+        inst_idx: int,
+        *,
+        seed: int,
+        hard: bool,
+        min_vars: int,
+        max_vars: int,
+        smt2_path: str | None,
+        instance_id: str | None,
+        ref_value,
+        ref_rlimit: int | None,
+        infer_pool: GpuInferPool,
+        instances: list | None = None,
+    ) -> tuple[int, list, float, dict]:
+        """单线程 collect 任务（共享 ``infer_pool`` / ``defer_logit``）。"""
+        hard_exprs, obj, sense = self._load_collect_instance(
+            inst_idx,
+            seed=seed,
+            hard=hard,
+            min_vars=min_vars,
+            max_vars=max_vars,
+            smt2_path=smt2_path,
+            instance_id=instance_id,
+            instances=instances,
+        )
+        steps, reward, res = self.collect(
+            hard_exprs,
+            obj,
+            sense,
+            ref_value=ref_value,
+            ref_rlimit=ref_rlimit,
+            infer_pool=infer_pool,
+        )
+        return inst_idx, steps, reward, res
+
     def _collect_parallel(
         self,
         count: int,
@@ -453,52 +512,58 @@ class DecideRLTrainer:
         hard: bool,
         min_vars: int,
         max_vars: int,
-        pool: ProcessPoolExecutor,
+        pool: ThreadPoolExecutor,
+        infer_pool: GpuInferPool,
         pbar=None,
         iter_idx: int = 0,
         smt2_paths: list[str] | None = None,
         instance_ids: list[str] | None = None,
         ref_values: list | None = None,
         ref_rlimits: list[int | None] | None = None,
+        instances: list | None = None,
     ) -> list[tuple[int, list, float, dict]]:
-        """多进程 collect；worker 固定 CPU，主进程 update 阶段再用 GPU。"""
-        policy_state = _policy_state_cpu(self.policy)
-        defer_val = float(self.defer_logit.detach().cpu())
-        worker_device = "cpu"
+        """多线程 collect：z3 并行，GNN 经 ``infer_pool`` 排队占用全部 GPU。"""
+        infer_pool.sync_from(self.policy)
         paths = smt2_paths or [None] * count
         ids = instance_ids or [None] * count
         vals = ref_values if ref_values is not None else [None] * count
         rls = ref_rlimits if ref_rlimits is not None else [None] * count
         if not (len(paths) == len(ids) == len(vals) == len(rls) == count):
             raise ValueError("smt2_paths / instance_ids / ref_* 长度必须等于实例数")
-        tasks = [
-            (
-                j,
-                seed,
-                hard,
-                min_vars,
-                max_vars,
-                policy_state,
-                defer_val,
-                self.config.refocus_every,
-                self.config.max_iters,
-                worker_device,
-                paths[j],
-                ids[j],
-                vals[j],
-                rls[j],
-            )
-            for j in range(count)
-        ]
+
+        # 避免多线程 × OpenMP 过订阅；推理在 GPU 上时 CPU 侧只需轻量调度
+        old_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
         results: list[tuple[int, list, float, dict]] = []
-        futures = [pool.submit(_rl_collect_worker, t) for t in tasks]
-        done = 0
-        for fut in as_completed(futures):
-            results.append(fut.result())
-            done += 1
-            if pbar is not None:
-                pbar.update(1)
-                pbar.set_postfix(iter=iter_idx, phase="collect", inst=f"{done}/{count}")
+        try:
+            futures = [
+                pool.submit(
+                    self._collect_one,
+                    j,
+                    seed=seed,
+                    hard=hard,
+                    min_vars=min_vars,
+                    max_vars=max_vars,
+                    smt2_path=paths[j],
+                    instance_id=ids[j],
+                    ref_value=vals[j],
+                    ref_rlimit=rls[j],
+                    infer_pool=infer_pool,
+                    instances=instances,
+                )
+                for j in range(count)
+            ]
+            done = 0
+            for fut in as_completed(futures):
+                results.append(fut.result())
+                done += 1
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        iter=iter_idx, phase="collect", inst=f"{done}/{count}"
+                    )
+        finally:
+            torch.set_num_threads(old_threads)
         results.sort(key=lambda x: x[0])
         return results
 
@@ -606,13 +671,13 @@ class DecideRLTrainer:
         eval_callback: Callable[[int, "DecideRLTrainer"], dict] | None = None,
         early_stop: EarlyStopConfig | None = None,
     ):
-        """REINFORCE 训练。``workers>1`` 且实例数足够时用 spawn 进程池并行 collect。
+        """REINFORCE 训练。``workers>1`` 且实例数足够时用线程池并行 collect。
 
-        ``smt2_paths`` 非空时 worker 从落盘文件读实例（与已有 dataset 对齐），否则按
-        seed 重建。``ref_values`` / ``ref_rlimits`` 为各实例的 ``ref/`` 缓存参考
-        （``value``←binary；``rlimit`` 在公平 VSIDS 命中最优时←VSIDS，否则←binary；
-        传入 ``solve_omt_with_decider`` 供 reward）。``checkpoint_dir`` 非空时每隔
-        ``checkpoint_every`` 轮保存中间权重。
+        并行时通过 :class:`GpuInferPool` 排队占用全部 GPU 做 GNN 推理（同进程、无
+        IPC）。``smt2_paths`` 非空时线程从落盘文件读实例，否则优先用传入的
+        ``instances``，再否则按 seed 重建。``ref_values`` / ``ref_rlimits`` 为各实例
+        的 ``ref/`` 缓存参考。``checkpoint_dir`` 非空时每隔 ``checkpoint_every`` 轮
+        保存中间权重。
 
         ``iterations=-1`` 时训练直到 ``early_stop`` 判定收敛（须提供
         ``eval_callback`` + ``early_stop``）；``iterations>0`` 时最多跑该轮数，
@@ -654,9 +719,11 @@ class DecideRLTrainer:
         use_parallel = n_workers > 1
         history = []
         eval_history: list[dict] = []
-        pool: ProcessPoolExecutor | None = None
+        thread_pool: ThreadPoolExecutor | None = None
+        infer_pool: GpuInferPool | None = None
         if use_parallel:
-            pool = _make_rl_process_pool(n_workers)
+            thread_pool = ThreadPoolExecutor(max_workers=n_workers)
+            infer_pool = self._ensure_infer_pool()
         if checkpoint_dir:
             os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -679,20 +746,22 @@ class DecideRLTrainer:
             with tqdm(total=pbar_total, desc="rl_train") as pbar:
                 for it in range(max_rounds):
                     if use_parallel:
-                        assert pool is not None
+                        assert thread_pool is not None and infer_pool is not None
                         batch = self._collect_parallel(
                             count,
                             seed=collect_seed,
                             hard=collect_hard,
                             min_vars=collect_min_vars,
                             max_vars=collect_max_vars,
-                            pool=pool,
+                            pool=thread_pool,
+                            infer_pool=infer_pool,
                             pbar=pbar,
                             iter_idx=it,
                             smt2_paths=smt2_paths,
                             instance_ids=instance_ids,
                             ref_values=vals,
                             ref_rlimits=rls,
+                            instances=None if smt2_paths else instances,
                         )
                         for upd_i, (j, steps, reward, res) in enumerate(batch):
                             stats = self.update(steps, reward, key=j)
@@ -822,8 +891,8 @@ class DecideRLTrainer:
                     else:
                         stop_reason = "completed"
         finally:
-            if pool is not None:
-                pool.shutdown(wait=True)
+            if thread_pool is not None:
+                thread_pool.shutdown(wait=True)
 
         # 启用早停时回滚到验证集最优权重（收敛 / 跑满上限均如此）
         if best_state is not None and early_stop is not None:
@@ -832,6 +901,8 @@ class DecideRLTrainer:
                 self.defer_logit.copy_(
                     torch.tensor(best_defer, device=self.defer_logit.device)
                 )
+            if self._infer_pool is not None:
+                self._infer_pool.sync_from(self.policy)
 
         # 在 history 末尾附一条汇总（便于日志 / JSON）
         history.append(
@@ -855,6 +926,7 @@ __all__ = [
     "MIN_INSTANCES_FOR_RL_PARALLEL",
     "effective_rl_workers",
     "decide_rl_reward",
+    "GpuInferPool",
     "SamplingPolicyDecider",
     "DecideRLConfig",
     "DecideRLTrainer",
