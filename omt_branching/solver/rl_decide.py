@@ -19,7 +19,6 @@ decide 都采样并记 step。
 
 from __future__ import annotations
 
-import math
 import multiprocessing as mp
 import os
 import queue
@@ -81,6 +80,20 @@ def decide_rl_reward(res: dict, ref_val, ref_rlimit) -> float:
         return (1 - x * x) / (1 + x * x)
 
     return _smooth(ratio)
+
+
+def sat_conflict_reward(conflicts, ref_conflicts, cap: float = 2.0) -> float:
+    """单次 SAT/SMT 可满足性检查的**归一化** conflicts 奖励,恒落在 ``[-1, 0]``。
+
+    锚点:``0`` = 零冲突(理论最优);``-1/cap``(默认 ``-0.5``)= 与参考(VSIDS)持平;
+    ``-1`` = 冲突数 ≥ ``cap×`` 参考。单调随 conflicts 递减,且**有界** —— 原
+    ``-log1p(conflicts)`` 无界且重尾,离群 episode 会主导 REINFORCE 梯度、训练不稳;有界
+    奖励 + 每实例 baseline 才稳定。锚在零冲突(而非 VSIDS 持平)可保留反超 VSIDS 的活梯度
+    (胜过 VSIDS 映射到 ``(-0.5, 0)``)。``ref_conflicts`` 缺失/非正时退回 ``1``(保守惩罚)。
+    """
+    ref = max(int(ref_conflicts), 1) if ref_conflicts else 1
+    ratio = min(conflicts / ref, cap)
+    return -ratio / cap
 
 
 def effective_rl_workers(
@@ -756,8 +769,18 @@ class DecideRLTrainer:
         }
         save_policy(self.policy, path, meta=payload_meta)
 
-    def collect_sat(self, assertions, atoms):
+    def collect_sat(self, assertions, atoms, ref_conflicts: int | None = None):
+        """采一次学习臂;reward = 归一化 ``[-1,0]`` 的 conflicts(见 :func:`sat_conflict_reward`)。
+
+        ``ref_conflicts`` 为同实例 VSIDS 臂的 conflicts(归一化参考);缺省时内部跑一次 VSIDS
+        求出(单实例调试方便,但训练应由 :meth:`train_sat` 预算好复用,避免每轮重算)。
+        """
         from omt_branching.solver.sat_solve import solve_sat_with_decider
+
+        if ref_conflicts is None:
+            ref_conflicts = solve_sat_with_decider(
+                list(assertions), list(atoms), None
+            )["conflicts"]
 
         holder: dict = {}
 
@@ -778,23 +801,37 @@ class DecideRLTrainer:
             list(assertions), list(atoms), decider_factory=lambda a: factory(a)
         )
         steps = holder["d"].steps if "d" in holder else []
-        reward = -math.log1p(res["conflicts"])
+        reward = sat_conflict_reward(res["conflicts"], ref_conflicts, self.config.reward_cap)
         return steps, reward, res
 
     def train_sat(self, problems, iterations: int = 1, log: bool = False):
-        """``problems = list[(atoms, clauses)]``（同生成器返回序）。"""
+        """``problems = list[(atoms, clauses)]``（同生成器返回序）。
+
+        每实例**一次性**算出 VSIDS 参考 conflicts(跨 iteration 复用),供 reward 归一化。
+        """
+        from omt_branching.solver.sat_solve import solve_sat_with_decider
+
         problems = list(problems)
+        refs = [
+            solve_sat_with_decider(list(clauses), list(atoms), None)["conflicts"]
+            for atoms, clauses in problems
+        ]
         history = []
         for it in range(iterations):
             for j, (atoms, assertions) in enumerate(problems):
-                steps, reward, res = self.collect_sat(assertions, atoms)
+                steps, reward, res = self.collect_sat(
+                    assertions, atoms, ref_conflicts=refs[j]
+                )
                 stats = self.update(steps, reward, key=j)
-                stats.update({"iter": it, "instance": j, "conflicts": res["conflicts"]})
+                stats.update({
+                    "iter": it, "instance": j, "conflicts": res["conflicts"],
+                    "ref_conflicts": refs[j], "reward": reward,
+                })
                 history.append(stats)
                 if log:
                     print(
                         f"[it {it} inst {j}] loss={stats['loss']:.4f} reward={reward:.3f} "
-                        f"conflicts={res['conflicts']} steps={stats['steps']}"
+                        f"conflicts={res['conflicts']} ref={refs[j]} steps={stats['steps']}"
                     )
         return history
 
