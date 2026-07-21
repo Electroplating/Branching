@@ -78,7 +78,18 @@ from omt_branching.solver.lookahead_cache import (
 from omt_branching.solver.sat_instances import generate_php, generate_rand_3sat, generate_hard_smt_lia
 from omt_branching.solver.sat_solve import solve_sat_with_decider
 from omt_branching.solver.vsids_trace import (
-    VSIDSTraceConfig, build_vsids_examples_sat, collect_vsids_trajectory,
+    VSIDSTraceConfig,
+    build_vsids_examples,
+    build_vsids_examples_from_smt2_parallel,
+    build_vsids_examples_sat,
+    collect_vsids_trajectory,
+    records_to_examples,
+)
+from omt_branching.solver.vsids_trace_cache import (
+    VSIDS_TRACE_SUBDIR,
+    has_vsids_trace_result,
+    load_vsids_trace_result,
+    save_vsids_trace_result,
 )
 from omt_branching.solver.strong_branch import (
     StrongBranchConfig, oracle_bool_choice, oracle_numeric_choice_sb,
@@ -190,6 +201,13 @@ __all__ = [
     "generate_hard_smt_lia",
     "solve_sat_with_decider",
     "VSIDSTraceConfig",
+    "build_vsids_examples",
+    "build_vsids_examples_from_smt2_parallel",
     "build_vsids_examples_sat",
     "collect_vsids_trajectory",
+    "records_to_examples",
+    "VSIDS_TRACE_SUBDIR",
+    "has_vsids_trace_result",
+    "load_vsids_trace_result",
+    "save_vsids_trace_result",
 ]

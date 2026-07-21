@@ -31,7 +31,7 @@ from pathlib import Path
 import torch
 
 from omt_branching.model.device import gnn_device
-from omt_branching.model.persistence import save_history
+from omt_branching.model.persistence import load_policy_into, save_history, save_policy
 from omt_branching.model.policy import BranchingPolicy
 from omt_branching.solver.rl_decide import (
     DEFAULT_RL_COLLECT_WORKERS,
@@ -67,6 +67,80 @@ ARTIFACTS = os.path.join(os.path.dirname(__file__), "artifacts")
 DEFAULT_DATASET_DIR = os.path.join(ARTIFACTS, "dataset")
 DEFAULT_CKPT_DIR = os.path.join(ARTIFACTS, "rl_checkpoints")
 DEFAULT_TEST_WORKERS = 30
+IMITATION_CKPT_NAME = "imitation.pt"
+
+
+def _imitation_ckpt_path(ckpt_dir: str) -> str:
+    return os.path.join(ckpt_dir, IMITATION_CKPT_NAME)
+
+
+def _imitation_fingerprint(args: argparse.Namespace) -> dict:
+    """决定 imitation 权重是否可复用的关键超参（写入 meta / 加载时比对）。"""
+    return {
+        "stage": "imitation",
+        "teacher": args.imitation_lookahead,
+        "epochs": int(args.epochs),
+        "vsids_max_ex": int(args.vsids_max_ex),
+        "vsids_stride": int(args.vsids_stride),
+        "imitation_nonroot": bool(args.imitation_nonroot),
+    }
+
+
+def _try_load_imitation_ckpt(
+    policy: BranchingPolicy,
+    ckpt_dir: str,
+    fingerprint: dict,
+    *,
+    device: str,
+    force: bool,
+) -> bool:
+    """若存在匹配的 imitation checkpoint 则加载并返回 True（可跳过训练）。"""
+    path = _imitation_ckpt_path(ckpt_dir)
+    if force or not os.path.isfile(path):
+        return False
+    try:
+        meta = load_policy_into(policy, path, map_location=device)
+    except Exception as exc:
+        print(f"imitation checkpoint 加载失败（将重训）: {path} ({exc})")
+        return False
+    mismatches = [
+        k for k, v in fingerprint.items()
+        if k != "stage" and meta.get(k) != v
+    ]
+    if mismatches:
+        detail = ", ".join(f"{k}: ckpt={meta.get(k)!r} now={fingerprint[k]!r}"
+                           for k in mismatches)
+        print(f"imitation checkpoint 超参不匹配（将重训）: {detail}")
+        return False
+    print(
+        f"加载 imitation checkpoint -> {path} "
+        f"(teacher={meta.get('teacher')}, epochs={meta.get('epochs')}, "
+        f"n_examples={meta.get('n_examples')})"
+    )
+    return True
+
+
+def _save_imitation_ckpt(
+    policy: BranchingPolicy,
+    ckpt_dir: str,
+    fingerprint: dict,
+    *,
+    n_examples: int,
+    hist: list[dict],
+) -> str:
+    os.makedirs(ckpt_dir, exist_ok=True)
+    path = _imitation_ckpt_path(ckpt_dir)
+    meta = {
+        **fingerprint,
+        "n_examples": int(n_examples),
+        "branch_loss_first": float((hist[0] if hist else {}).get("branch", 0.0)),
+        "branch_loss_last": float((hist[-1] if hist else {}).get("branch", 0.0)),
+    }
+    save_policy(policy, path, meta=meta)
+    hist_path = os.path.join(ckpt_dir, "imitation_history.json")
+    if hist:
+        save_history(hist, hist_path)
+    return path
 
 
 def _json_value(v):
@@ -146,8 +220,45 @@ def _require_imitation_lookahead_cache(
     entries: list[dict],
     *,
     kind: str,
+    vsids_stride: int = 1,
+    vsids_max_ex: int = 40,
 ) -> None:
-    """imitation 默认只读已有 look-ahead 缓存；缺失则提示先跑构建脚本。"""
+    """imitation 默认只读已有教师缓存；缺失则提示先跑构建脚本。"""
+    if kind == "vsids":
+        from omt_branching.solver.vsids_trace_cache import (
+            has_vsids_trace_result,
+            load_vsids_trace_result,
+        )
+
+        missing = []
+        for e in entries:
+            iid = e["instance_id"]
+            if not has_vsids_trace_result(dataset_dir, iid, split=split):
+                missing.append(iid)
+                continue
+            cached = load_vsids_trace_result(
+                dataset_dir,
+                iid,
+                split=split,
+                stride=vsids_stride,
+                max_examples=vsids_max_ex,
+            )
+            # 空 records 仍算有效缓存（该实例 VSIDS 未落在注册原子上）
+            if cached is None:
+                missing.append(iid)
+        if missing:
+            preview = ", ".join(missing[:5])
+            more = f" 等共 {len(missing)} 个" if len(missing) > 5 else ""
+            raise SystemExit(
+                f"划分 {split} 缺少可用的 VSIDS 轨迹缓存"
+                f"（如 {preview}{more}；含 stride/max_ex 不匹配）。\n"
+                f"请先运行: python -m examples.build_vsids_trace_cache "
+                f"--dataset-dir {dataset_dir} --split {split} "
+                f"--stride {vsids_stride} --max-ex {vsids_max_ex}\n"
+                f"或加 --rebuild-lookahead 允许在 imitation 时现算缺失项。"
+            )
+        return
+
     if kind == "objective":
         from examples.build_objective_lookahead import (
             has_objective_lookahead_result,
@@ -446,24 +557,42 @@ def main() -> None:
     ap.add_argument(
         "--imitation",
         action="store_true",
-        help="在 train 划分上做 look-ahead imitation",
+        help=(
+            "在 train 划分上做 imitation 冷启动；"
+            "若 ckpt-dir/imitation.pt 超参匹配则直接加载并跳过训练"
+        ),
     )
     ap.add_argument(
         "--imitation-lookahead",
-        choices=["split", "objective"],
+        choices=["split", "objective", "vsids"],
         default="split",
-        help="imitation 教师类型：split=传播强度 look-ahead；objective=目标值 look-ahead",
+        help=(
+            "imitation 教师：split=传播强度 look-ahead；"
+            "objective=目标值 look-ahead；vsids=VSIDS 轨迹模仿"
+        ),
     )
     ap.add_argument(
         "--rebuild-lookahead",
         action="store_true",
-        help="imitation 时若缺 look-ahead 缓存则现算并写入；默认只读已有缓存",
+        help="imitation 时若缺教师缓存则现算并写入；默认只读已有缓存",
     )
     ap.add_argument(
         "--imitation-nonroot",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="objective imitation 是否纳入非根样本（默认开启；--no-imitation-nonroot 关闭）",
+    )
+    ap.add_argument(
+        "--vsids-max-ex",
+        type=int,
+        default=40,
+        help="vsids 教师：单实例样本上限（0=不限；须与缓存构建一致）",
+    )
+    ap.add_argument(
+        "--vsids-stride",
+        type=int,
+        default=1,
+        help="vsids 教师：每 stride 次注册原子决策留 1 条",
     )
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument(
@@ -499,7 +628,12 @@ def main() -> None:
     ap.add_argument(
         "--ckpt-dir",
         default=DEFAULT_CKPT_DIR,
-        help="RL 中间 checkpoint 目录",
+        help="checkpoint 目录（imitation.pt 与 RL iter_*.pt 同目录）",
+    )
+    ap.add_argument(
+        "--force-imitation",
+        action="store_true",
+        help="忽略已有 imitation.pt，强制重跑 imitation 并覆盖",
     )
     ap.add_argument(
         "--ckpt-every",
@@ -599,80 +733,125 @@ def main() -> None:
     if args.imitation:
         from omt_branching.model.trainer import ImitationTrainer, TrainConfig
 
-        lookahead_workers = args.test_workers
-        paths = _smt2_abs_paths(dataset_dir, train_entries)
-        ids = [e["instance_id"] for e in train_entries]
-        la_kind = args.imitation_lookahead
-        rebuild = bool(args.rebuild_lookahead)
-        if not rebuild:
-            _require_imitation_lookahead_cache(
-                dataset_dir, "train", train_entries, kind=la_kind
-            )
-        if la_kind == "objective":
-            from examples.build_objective_lookahead import (
-                build_objective_lookahead_examples_from_smt2_parallel,
-            )
-            from omt_branching.solver.binary_results import (
-                binary_value,
-                load_binary_result,
-            )
-
-            opt_values = []
-            for iid in ids:
-                if load_binary_result(dataset_dir, iid, split="train") is None:
-                    opt_values.append(None)
-                else:
-                    try:
-                        opt_values.append(
-                            binary_value(dataset_dir, iid, split="train")
-                        )
-                    except Exception:
-                        opt_values.append(None)
-            print(
-                f"objective look-ahead 标签: {len(paths)} 实例, "
-                f"workers={lookahead_workers}, "
-                f"{'可现算缺失' if rebuild else '只读 lookahead_objective/ 缓存'}, "
-                f"nonroot={args.imitation_nonroot}"
-            )
-            raw_exs = build_objective_lookahead_examples_from_smt2_parallel(
-                paths,
-                instance_ids=ids,
-                workers=lookahead_workers,
-                dataset_dir=dataset_dir,
-                split="train",
-                use_cache=True,
-                cache_only=not rebuild,
-                include_nonroot=bool(args.imitation_nonroot),
-                z3_path=z3_path,
-                opt_values=opt_values,
-            )
+        imit_fp = _imitation_fingerprint(args)
+        if _try_load_imitation_ckpt(
+            policy,
+            args.ckpt_dir,
+            imit_fp,
+            device=device,
+            force=bool(args.force_imitation),
+        ):
+            print("跳过 imitation（已从 checkpoint 恢复）")
         else:
-            from omt_branching.solver.training_data import (
-                build_lookahead_examples_from_smt2_parallel,
-            )
+            lookahead_workers = args.test_workers
+            paths = _smt2_abs_paths(dataset_dir, train_entries)
+            ids = [e["instance_id"] for e in train_entries]
+            la_kind = args.imitation_lookahead
+            rebuild = bool(args.rebuild_lookahead)
+            if not rebuild:
+                _require_imitation_lookahead_cache(
+                    dataset_dir,
+                    "train",
+                    train_entries,
+                    kind=la_kind,
+                    vsids_stride=args.vsids_stride,
+                    vsids_max_ex=args.vsids_max_ex,
+                )
+            if la_kind == "vsids":
+                from omt_branching.solver.vsids_trace import (
+                    VSIDSTraceConfig,
+                    build_vsids_examples_from_smt2_parallel,
+                )
 
+                vsids_cfg = VSIDSTraceConfig(
+                    stride=args.vsids_stride,
+                    max_examples=args.vsids_max_ex,
+                )
+                print(
+                    f"VSIDS 轨迹标签: {len(paths)} 实例, "
+                    f"workers={lookahead_workers}, "
+                    f"stride={vsids_cfg.stride}, max_ex={vsids_cfg.max_examples}, "
+                    f"{'可现算缺失' if rebuild else '只读 vsids_trace/ 缓存'}"
+                )
+                raw_exs = build_vsids_examples_from_smt2_parallel(
+                    paths,
+                    instance_ids=ids,
+                    config=vsids_cfg,
+                    workers=lookahead_workers,
+                    dataset_dir=dataset_dir,
+                    split="train",
+                    use_cache=True,
+                    cache_only=not rebuild,
+                )
+            elif la_kind == "objective":
+                from examples.build_objective_lookahead import (
+                    build_objective_lookahead_examples_from_smt2_parallel,
+                )
+
+                opt_values = []
+                for iid in ids:
+                    if load_binary_result(dataset_dir, iid, split="train") is None:
+                        opt_values.append(None)
+                    else:
+                        try:
+                            opt_values.append(
+                                binary_value(dataset_dir, iid, split="train")
+                            )
+                        except Exception:
+                            opt_values.append(None)
+                print(
+                    f"objective look-ahead 标签: {len(paths)} 实例, "
+                    f"workers={lookahead_workers}, "
+                    f"{'可现算缺失' if rebuild else '只读 lookahead_objective/ 缓存'}, "
+                    f"nonroot={args.imitation_nonroot}"
+                )
+                raw_exs = build_objective_lookahead_examples_from_smt2_parallel(
+                    paths,
+                    instance_ids=ids,
+                    workers=lookahead_workers,
+                    dataset_dir=dataset_dir,
+                    split="train",
+                    use_cache=True,
+                    cache_only=not rebuild,
+                    include_nonroot=bool(args.imitation_nonroot),
+                    z3_path=z3_path,
+                    opt_values=opt_values,
+                )
+            else:
+                from omt_branching.solver.training_data import (
+                    build_lookahead_examples_from_smt2_parallel,
+                )
+
+                print(
+                    f"split look-ahead 标签: {len(paths)} 实例, "
+                    f"workers={lookahead_workers}, "
+                    f"{'可现算缺失' if rebuild else '只读 lookahead/ 缓存'}"
+                )
+                raw_exs = build_lookahead_examples_from_smt2_parallel(
+                    paths,
+                    instance_ids=ids,
+                    workers=lookahead_workers,
+                    dataset_dir=dataset_dir,
+                    split="train",
+                    use_cache=True,
+                    cache_only=not rebuild,
+                )
+            exs = [e for e in raw_exs if e.bool_target_scores]
+            hist = ImitationTrainer(policy, TrainConfig(lr=5e-3, device=device)).fit(
+                exs, epochs=args.epochs
+            )
             print(
-                f"split look-ahead 标签: {len(paths)} 实例, "
-                f"workers={lookahead_workers}, "
-                f"{'可现算缺失' if rebuild else '只读 lookahead/ 缓存'}"
+                f"{la_kind} imitation: {len(exs)} 样本, branch loss "
+                f"{hist[0].get('branch', 0):.3f} -> {hist[-1].get('branch', 0):.3f}"
             )
-            raw_exs = build_lookahead_examples_from_smt2_parallel(
-                paths,
-                instance_ids=ids,
-                workers=lookahead_workers,
-                dataset_dir=dataset_dir,
-                split="train",
-                use_cache=True,
-                cache_only=not rebuild,
+            ckpt_path = _save_imitation_ckpt(
+                policy,
+                args.ckpt_dir,
+                imit_fp,
+                n_examples=len(exs),
+                hist=hist,
             )
-        exs = [e for e in raw_exs if e.bool_target_scores]
-        hist = ImitationTrainer(policy, TrainConfig(lr=5e-3, device=device)).fit(
-            exs, epochs=args.epochs
-        )
-        print(
-            f"{la_kind} look-ahead imitation: {len(exs)} 样本, branch loss "
-            f"{hist[0].get('branch', 0):.3f} -> {hist[-1].get('branch', 0):.3f}"
-        )
+            print(f"imitation checkpoint -> {ckpt_path}")
 
     if args.rl_iters != 0:
         missing = missing_binary_ids(dataset_dir, train_entries, split="train")

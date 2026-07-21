@@ -7,7 +7,15 @@ from omt_branching.model.policy import BranchingPolicy
 from omt_branching.solver.propagator_snapshot import atom_key
 from omt_branching.solver.sat_instances import generate_php, generate_rand_3sat
 from omt_branching.solver.vsids_trace import (
-    VSIDSTraceConfig, build_vsids_examples_sat, collect_vsids_trajectory,
+    VSIDSTraceConfig,
+    build_vsids_examples_sat,
+    collect_vsids_trajectory,
+    records_to_examples,
+)
+from omt_branching.solver.vsids_trace_cache import (
+    has_vsids_trace_result,
+    load_vsids_trace_result,
+    save_vsids_trace_result,
 )
 
 
@@ -59,3 +67,38 @@ def test_vsids_examples_are_learnable():
     assert len(exs) >= 4
     h = ImitationTrainer(BranchingPolicy(), TrainConfig(lr=5e-3)).fit(exs, epochs=40)
     assert h[-1]["branch"] < h[0]["branch"]
+
+
+def test_vsids_trace_cache_roundtrip(tmp_path):
+    """落盘缓存可复现 records，且 config 指纹不匹配时拒绝加载。"""
+    atoms, clauses = generate_php(4)
+    cfg = VSIDSTraceConfig(max_examples=5, stride=1)
+    records, ref_conflicts, info = collect_vsids_trajectory(clauses, atoms, cfg)
+    assert records
+    save_vsids_trace_result(
+        tmp_path,
+        "php4",
+        split="train",
+        records=records,
+        ref_conflicts=ref_conflicts,
+        info=info,
+        stride=cfg.stride,
+        max_examples=cfg.max_examples,
+    )
+    assert has_vsids_trace_result(tmp_path, "php4", split="train")
+    loaded = load_vsids_trace_result(
+        tmp_path, "php4", split="train",
+        stride=cfg.stride, max_examples=cfg.max_examples,
+    )
+    assert loaded is not None
+    assert len(loaded["records"]) == len(records)
+    assert loaded["records"][0][1] == records[0][1]
+    # config 不匹配 → None
+    assert load_vsids_trace_result(
+        tmp_path, "php4", split="train", stride=2, max_examples=cfg.max_examples
+    ) is None
+    # 从缓存重建样本应与现算一致（样本数）
+    exs_cached = records_to_examples(clauses, loaded["records"], cfg)
+    exs_fresh = records_to_examples(clauses, records, cfg)
+    assert len(exs_cached) == len(exs_fresh)
+    assert exs_cached[0].bool_target_scores

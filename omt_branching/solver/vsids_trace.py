@@ -127,6 +127,28 @@ def collect_vsids_trajectory(assertions, atoms, config: VSIDSTraceConfig = VSIDS
     return sink, ref_conflicts, info
 
 
+def records_to_examples(
+    assertions,
+    records: list[tuple[dict[str, bool], str, bool]],
+    config: VSIDSTraceConfig = VSIDSTraceConfig(),
+) -> list[RankingExample]:
+    """把轨迹记录转为 RankingExample：每条记录一张图 + 近似 one-hot 标签。"""
+    out: list[RankingExample] = []
+    hard = list(assertions)
+    for assignment, chosen_key, phase in records:
+        snap, _ = build_bool_snapshot(hard, assignment=assignment)
+        graph = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
+        bmap = graph.id_maps.get(NodeType.BOOL_VAR, {})
+        if chosen_key not in bmap:
+            continue
+        undecided = [k for k in bmap if k not in assignment]
+        bts = {bmap[k]: (config.weight if k == chosen_key else 0.0) for k in undecided}
+        bts[bmap[chosen_key]] = config.weight  # 保证被选原子入表
+        pts = {bmap[chosen_key]: phase}
+        out.append(RankingExample(graph=graph, bool_target_scores=bts, phase_targets=pts))
+    return out
+
+
 def build_vsids_examples_sat(problems, config: VSIDSTraceConfig = VSIDSTraceConfig()):
     """VSIDS 模仿样本(与 ``build_lookahead_examples_sat`` 同签名,可直接替换教师)。
 
@@ -136,19 +158,193 @@ def build_vsids_examples_sat(problems, config: VSIDSTraceConfig = VSIDSTraceConf
     """
     out: list[RankingExample] = []
     for atoms, assertions in problems:
-        records, _ref, _info = collect_vsids_trajectory(list(assertions), list(atoms), config)
-        for assignment, chosen_key, phase in records:
-            snap, _ = build_bool_snapshot(list(assertions), assignment=assignment)
-            graph = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
-            bmap = graph.id_maps.get(NodeType.BOOL_VAR, {})
-            if chosen_key not in bmap:
-                continue
-            undecided = [k for k in bmap if k not in assignment]
-            bts = {bmap[k]: (config.weight if k == chosen_key else 0.0) for k in undecided}
-            bts[bmap[chosen_key]] = config.weight   # 保证被选原子入表(即便 undecided 计算漏掉)
-            pts = {bmap[chosen_key]: phase}
-            out.append(RankingExample(graph=graph, bool_target_scores=bts, phase_targets=pts))
+        records, _ref, _info = collect_vsids_trajectory(
+            list(assertions), list(atoms), config
+        )
+        out.extend(records_to_examples(assertions, records, config))
     return out
 
 
-__all__ = ["VSIDSTraceConfig", "collect_vsids_trajectory", "build_vsids_examples_sat"]
+def _omt_assertions_and_atoms(inst):
+    """与部署 decider 一致：预处理后断言 + 析取子句注册原子。"""
+    from omt_branching.solver.propagator_snapshot import prepare_propagator_formula
+
+    return prepare_propagator_formula(list(inst.hard))
+
+
+def _compute_and_maybe_cache_vsids(
+    inst,
+    config: VSIDSTraceConfig,
+    *,
+    dataset_dir: str | None = None,
+    split: str | None = None,
+    use_cache: bool = True,
+    cache_only: bool = False,
+) -> list[RankingExample]:
+    """采集/读缓存 VSIDS 轨迹并建样本。
+
+    ``cache_only=True`` 时只读缓存，缺失则返回空列表（不现算）。
+    """
+    from omt_branching.solver.vsids_trace_cache import (
+        load_vsids_trace_result,
+        save_vsids_trace_result,
+    )
+
+    assertions, atoms = _omt_assertions_and_atoms(inst)
+    cached = None
+    if use_cache and dataset_dir and split and inst.instance_id:
+        cached = load_vsids_trace_result(
+            dataset_dir,
+            inst.instance_id,
+            split=split,
+            stride=config.stride,
+            max_examples=config.max_examples,
+        )
+    if cached is not None:
+        return records_to_examples(assertions, cached["records"], config)
+    if cache_only:
+        return []
+
+    records, ref_conflicts, info = collect_vsids_trajectory(
+        assertions, atoms, config
+    )
+    # 空轨迹也落盘：标记「已采集、无注册原子决策」，避免每次被当成缺失重算
+    if use_cache and dataset_dir and split and inst.instance_id:
+        save_vsids_trace_result(
+            dataset_dir,
+            inst.instance_id,
+            split=split,
+            records=records,
+            ref_conflicts=ref_conflicts,
+            info=info,
+            stride=config.stride,
+            max_examples=config.max_examples,
+        )
+    return records_to_examples(assertions, records, config)
+
+
+def build_vsids_examples(instances, config: VSIDSTraceConfig = VSIDSTraceConfig()):
+    """从 OMT 实例构造 VSIDS 轨迹 imitation 样本（与部署注册原子一致）。"""
+    out: list[RankingExample] = []
+    for inst in instances:
+        out.extend(_compute_and_maybe_cache_vsids(inst, config, use_cache=False))
+    return out
+
+
+def _vsids_from_smt2_worker(task: tuple) -> tuple[int, list[RankingExample]]:
+    """ProcessPool worker：从已落盘 ``.smt2`` 读实例；优先用 VSIDS 轨迹缓存。"""
+    (
+        index,
+        smt2_path,
+        instance_id,
+        stride,
+        max_examples,
+        weight,
+        dataset_dir,
+        split,
+        use_cache,
+        cache_only,
+    ) = task
+    from omt_branching.solver.decide_omt import smt2_to_instance
+
+    inst = smt2_to_instance(smt2_path, instance_id=instance_id)
+    cfg = VSIDSTraceConfig(
+        stride=stride, max_examples=max_examples, weight=weight
+    )
+    return index, _compute_and_maybe_cache_vsids(
+        inst,
+        cfg,
+        dataset_dir=dataset_dir,
+        split=split,
+        use_cache=use_cache,
+        cache_only=cache_only,
+    )
+
+
+DEFAULT_VSIDS_WORKERS = 8
+
+
+def build_vsids_examples_from_smt2_parallel(
+    smt2_paths: list[str],
+    *,
+    instance_ids: list[str] | None = None,
+    config: VSIDSTraceConfig | None = None,
+    workers: int = DEFAULT_VSIDS_WORKERS,
+    dataset_dir: str | None = None,
+    split: str | None = None,
+    use_cache: bool = True,
+    cache_only: bool = False,
+) -> list[RankingExample]:
+    """从已落盘 ``.smt2`` 并行构造 VSIDS 轨迹样本。
+
+    ``dataset_dir`` + ``split`` 非空且 ``use_cache`` 时：优先读
+    ``vsids_trace/<split>/<id>.json``；缺失则采集后即时写入（``cache_only`` 时跳过）。
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    from tqdm import tqdm
+
+    if not smt2_paths:
+        return []
+    cfg = config or VSIDSTraceConfig()
+    ids = instance_ids or [None] * len(smt2_paths)
+    if len(ids) != len(smt2_paths):
+        raise ValueError("instance_ids 长度必须与 smt2_paths 一致")
+    if workers <= 1:
+        from omt_branching.solver.decide_omt import smt2_to_instance
+
+        out: list[RankingExample] = []
+        for path, iid in zip(smt2_paths, ids):
+            inst = smt2_to_instance(path, instance_id=iid)
+            out.extend(
+                _compute_and_maybe_cache_vsids(
+                    inst,
+                    cfg,
+                    dataset_dir=dataset_dir,
+                    split=split,
+                    use_cache=use_cache,
+                    cache_only=cache_only,
+                )
+            )
+        return out
+
+    n = len(smt2_paths)
+    workers = min(workers, n)
+    tasks = [
+        (
+            i,
+            smt2_paths[i],
+            ids[i],
+            cfg.stride,
+            cfg.max_examples,
+            cfg.weight,
+            dataset_dir,
+            split,
+            use_cache,
+            cache_only,
+        )
+        for i in range(n)
+    ]
+    slots: list[list[RankingExample]] = [[] for _ in range(n)]
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_vsids_from_smt2_worker, t) for t in tasks]
+        with tqdm(total=len(tasks), desc="vsids_trace") as pbar:
+            for fut in as_completed(futures):
+                index, exs = fut.result()
+                slots[index] = exs
+                pbar.update(1)
+    out: list[RankingExample] = []
+    for exs in slots:
+        out.extend(exs)
+    return out
+
+
+__all__ = [
+    "VSIDSTraceConfig",
+    "collect_vsids_trajectory",
+    "records_to_examples",
+    "build_vsids_examples_sat",
+    "build_vsids_examples",
+    "build_vsids_examples_from_smt2_parallel",
+    "DEFAULT_VSIDS_WORKERS",
+]
