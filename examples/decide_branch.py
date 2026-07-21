@@ -364,6 +364,9 @@ def _eval_test_worker(task: tuple) -> dict:
     inst = smt2_to_instance(smt2_path, instance_id=instance_id)
     hard, obj, sense = inst.as_tuple()
     ref_val = ref_cache.get("value")
+    ref_rl = ref_cache.get("rlimit")
+    if ref_rl is not None:
+        ref_rl = int(ref_rl)
     bin_stats = binary_stats_from_ref(ref_cache)
     v = vsids_stats_from_ref(ref_cache)
     csl = check_sat_loop_stats_from_ref(ref_cache)
@@ -378,6 +381,7 @@ def _eval_test_worker(task: tuple) -> dict:
         decider_factory=_make_eval_decider_factory(
             policy, device, refocus, defer_logit, sticky_window
         ),
+        ref_rlimit=ref_rl,
     )
     return {
         "instance_id": inst.instance_id,
@@ -408,6 +412,8 @@ def _eval_val_worker(task: tuple) -> dict:
     ref = binary_result
     ref_val = ref.get("value")
     ref_rl = ref.get("rlimit")
+    if ref_rl is not None:
+        ref_rl = int(ref_rl)
     policy = BranchingPolicy()
     policy.load_state_dict(policy_state)
     policy.to(device)
@@ -427,6 +433,7 @@ def _eval_val_worker(task: tuple) -> dict:
         "reward": reward,
         "weighted_rlimit": ln.get("weighted rlimit"),
         "rlimit": ln.get("rlimit"),
+        "truncated": bool(ln.get("truncated")),
         "match": 1.0 if ln.get("value") == ref_val else 0.0,
     }
 
@@ -951,6 +958,8 @@ def main() -> None:
                 )
                 return metrics
 
+        hist_path = os.path.join(ARTIFACTS, "rl_decide_history.json")
+        print(f"RL history 将写入 -> {hist_path}（每轮 update 后、验证前）")
         h = rlt.train(
             [i.as_tuple() for i in rl_train],
             iterations=args.rl_iters,
@@ -964,6 +973,7 @@ def main() -> None:
             collect_batch_size=rl_batch,
             checkpoint_dir=args.ckpt_dir,
             checkpoint_every=args.ckpt_every,
+            history_path=hist_path,
             eval_callback=eval_cb,
             early_stop=early_cfg,
         )
@@ -979,8 +989,6 @@ def main() -> None:
                 "best_metric": end_meta.get("best_metric"),
             },
         )
-        hist_path = os.path.join(ARTIFACTS, "rl_decide_history.json")
-        save_history(h, hist_path)
         print(f"RL 最终权重 -> {final_path}")
         print(f"RL 历史 -> {hist_path}")
         if end_meta:

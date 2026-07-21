@@ -886,6 +886,7 @@ class DecideRLTrainer:
         collect_batch_size: int | None = None,
         checkpoint_dir: str | None = None,
         checkpoint_every: int = 1,
+        history_path: str | None = None,
         eval_callback: Callable[[int, "DecideRLTrainer"], dict] | None = None,
         early_stop: EarlyStopConfig | None = None,
     ):
@@ -896,6 +897,9 @@ class DecideRLTrainer:
         时 worker 从落盘文件读实例，否则按 seed 重建。``ref_values`` /
         ``ref_rlimits`` 为各实例的 ``ref/`` 缓存参考。``checkpoint_dir`` 非空时每隔
         ``checkpoint_every`` 轮保存中间权重。
+
+        ``history_path`` 非空时，每轮 collect/update 结束后、验证集评估**之前**
+        落盘训练历史（崩溃时可保留本轮进度）；训练结束再写一次含 ``train_end``。
 
         ``collect_batch_size``（或 ``config.collect_batch_size``）限制每轮 collect
         的实例数；未设则整集。``sticky_window`` 见 :class:`DecideRLConfig`。
@@ -1080,6 +1084,12 @@ class DecideRLTrainer:
                             },
                         )
 
+                    # 在验证集评估之前落盘，避免 eval 崩溃丢失本轮 collect/update
+                    if history_path:
+                        from omt_branching.model.persistence import save_history
+
+                        save_history(history, history_path)
+
                     if (
                         early_stop is not None
                         and eval_callback is not None
@@ -1163,6 +1173,10 @@ class DecideRLTrainer:
                 "sticky_window": self.config.sticky_window,
             }
         )
+        if history_path:
+            from omt_branching.model.persistence import save_history
+
+            save_history(history, history_path)
         return history
 
 

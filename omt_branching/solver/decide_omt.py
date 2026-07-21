@@ -73,7 +73,7 @@ def solve_omt_with_decider(
       建图断言，并刷新根级 ``consequences`` 强制赋值（跨 cut 简化建图）；不额外
       ``prop.add``：单元 cut 本就不注册。
 
-    若给定 ``ref_rlimit``，当前消耗超出 ``5 * ref_rlimit`` 时提前返回（未达最优时
+    若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时提前返回（未达最优时
     reward 侧多为 -1.0，返回 dict 含 ``truncated=True``）；未给定时不做该剪枝。
     **仅用于** learned/RL 评测加速；构造 ``ref/`` 参考缓存时必须 ``ref_rlimit=None``，
     否则公平 VSIDS 常被截断在次优解，与 check-sat-loop / binary 的 ``value`` 不一致。
@@ -117,7 +117,7 @@ def solve_omt_with_decider(
     iters = 0
     truncated = False
     for iters in range(1, max_iters + 1):
-        if ref_rlimit is not None and rlimit - solver_rlimit > 5 * ref_rlimit:
+        if ref_rlimit is not None and rlimit - solver_rlimit > 2 * ref_rlimit:
             truncated = True
             break
         cut = obj_iso > best_val if sense is Sense.MAX else obj_iso < best_val
