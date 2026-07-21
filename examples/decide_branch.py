@@ -378,6 +378,12 @@ def main() -> None:
         action="store_true",
         help="在 train 划分上做 look-ahead imitation",
     )
+    ap.add_argument(
+        "--imitation-lookahead",
+        choices=["split", "objective"],
+        default="split",
+        help="imitation 教师类型：split=传播强度 look-ahead；objective=目标值 look-ahead",
+    )
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument(
         "--rl-iters",
@@ -511,20 +517,55 @@ def main() -> None:
     test_defer_logit = 0.0
     if args.imitation:
         from omt_branching.model.trainer import ImitationTrainer, TrainConfig
-        from omt_branching.solver.training_data import (
-            build_lookahead_examples_from_smt2_parallel,
-        )
 
         lookahead_workers = args.test_workers
         paths = _smt2_abs_paths(dataset_dir, train_entries)
         ids = [e["instance_id"] for e in train_entries]
-        print(
-            f"look-ahead 标签构建: {len(paths)} 实例(from smt2), "
-            f"workers={lookahead_workers}（优先读 lookahead/ 缓存）"
-        )
-        exs = [
-            e
-            for e in build_lookahead_examples_from_smt2_parallel(
+        la_kind = args.imitation_lookahead
+        if la_kind == "objective":
+            from examples.build_objective_lookahead import (
+                build_objective_lookahead_examples_from_smt2_parallel,
+            )
+            from omt_branching.solver.binary_results import (
+                binary_value,
+                load_binary_result,
+            )
+
+            opt_values = []
+            for iid in ids:
+                if load_binary_result(dataset_dir, iid, split="train") is None:
+                    opt_values.append(None)
+                else:
+                    try:
+                        opt_values.append(
+                            binary_value(dataset_dir, iid, split="train")
+                        )
+                    except Exception:
+                        opt_values.append(None)
+            print(
+                f"objective look-ahead 标签构建: {len(paths)} 实例(from smt2), "
+                f"workers={lookahead_workers}（优先读 lookahead_objective/ 缓存）"
+            )
+            raw_exs = build_objective_lookahead_examples_from_smt2_parallel(
+                paths,
+                instance_ids=ids,
+                workers=lookahead_workers,
+                dataset_dir=dataset_dir,
+                split="train",
+                use_cache=True,
+                z3_path=z3_path,
+                opt_values=opt_values,
+            )
+        else:
+            from omt_branching.solver.training_data import (
+                build_lookahead_examples_from_smt2_parallel,
+            )
+
+            print(
+                f"split look-ahead 标签构建: {len(paths)} 实例(from smt2), "
+                f"workers={lookahead_workers}（优先读 lookahead/ 缓存）"
+            )
+            raw_exs = build_lookahead_examples_from_smt2_parallel(
                 paths,
                 instance_ids=ids,
                 workers=lookahead_workers,
@@ -532,13 +573,12 @@ def main() -> None:
                 split="train",
                 use_cache=True,
             )
-            if e.bool_target_scores
-        ]
+        exs = [e for e in raw_exs if e.bool_target_scores]
         hist = ImitationTrainer(policy, TrainConfig(lr=5e-3, device=device)).fit(
             exs, epochs=args.epochs
         )
         print(
-            f"look-ahead imitation: {len(exs)} 样本, branch loss "
+            f"{la_kind} look-ahead imitation: {len(exs)} 样本, branch loss "
             f"{hist[0].get('branch', 0):.3f} -> {hist[-1].get('branch', 0):.3f}"
         )
 

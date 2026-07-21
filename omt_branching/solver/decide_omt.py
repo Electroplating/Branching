@@ -473,7 +473,7 @@ def load_dataset(path, *, split: str | None = None) -> list[OMTInstance]:
 
 def _discover_split_dirs(root: Path) -> list[str]:
     """返回含 ``*.smt2`` 的一级子目录名（排除缓存/产物目录）。"""
-    skip = {"binary", "ref", "lookahead", "rl_checkpoints"}
+    skip = {"binary", "ref", "lookahead", "lookahead_objective", "rl_checkpoints"}
     found: list[str] = []
     if not root.is_dir():
         return found
