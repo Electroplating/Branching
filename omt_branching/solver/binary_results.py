@@ -7,11 +7,14 @@
 缓存约定：
 
 - ``value``：始终来自 z3 **binary** 最优目标值；
-- ``rlimit``：RL / 剪枝用的参考资源——当公平 VSIDS 目标值与 binary 一致时取
-  VSIDS 的 ``rlimit``（否则回退 binary 的 ``rlimit``）；
+- ``rlimit``：RL / 剪枝用的参考资源——当公平 VSIDS 目标值与 binary 一致且
+  **未** ``truncated`` 时取 VSIDS 的 ``rlimit``（否则回退 binary 的 ``rlimit``）；
 - ``binary``：z3 二进制统计；
 - ``vsids``：公平 VSIDS（预处理 + 挂 propagator、decide 恒 defer）；
 - ``check_sat_loop``：原无 propagator 的 Solver 线性搜索臂（同样预处理）。
+
+构造 ``vsids`` / ``check_sat_loop`` 时不得传入 ``ref_rlimit`` 剪枝，否则 VSIDS
+易截断在次优解，与 CSL 的 ``value`` 不一致。
 
 并行求解时每实例独立文件，完成后立即写入，无共享锁。
 """
@@ -130,18 +133,33 @@ def build_ref_payload(
     """由 binary / 公平 VSIDS / check-sat-loop 结果构造缓存 payload。
 
     - ``value`` ← binary
-    - ``rlimit`` ← 公平 VSIDS 的 ``rlimit``（目标值与 binary 一致时）否则 binary
+    - ``rlimit`` ← 公平 VSIDS 的 ``rlimit``（目标值与 binary 一致且未截断时）否则 binary
+
+    诊断字段：``vsids_match`` / ``csl_match`` / ``vsids_csl_match``；若任一带
+    ``truncated=True``，对应 match 仍按值比较，但 ``*_truncated`` 会标出。
     """
     bin_val = binary_result.get("value")
     vsids = vsids_result or {}
     csl = check_sat_loop_result or {}
     vsids_val = vsids.get("value")
-    match = (
+    csl_val = csl.get("value")
+    vsids_match = (
         bin_val is not None
         and vsids_val is not None
         and vsids_val == bin_val
     )
-    if match:
+    csl_match = (
+        bin_val is not None
+        and csl_val is not None
+        and csl_val == bin_val
+    )
+    vsids_csl_match = (
+        vsids_val is not None
+        and csl_val is not None
+        and vsids_val == csl_val
+    )
+    # 截断次优解不能当公平 VSIDS 参考 rlimit
+    if vsids_match and not vsids.get("truncated"):
         ref_rl = vsids.get("rlimit")
         source = "vsids"
     else:
@@ -152,7 +170,11 @@ def build_ref_payload(
         "value": bin_val,
         "rlimit": ref_rl,
         "rlimit_source": source,
-        "vsids_match": bool(match),
+        "vsids_match": bool(vsids_match),
+        "csl_match": bool(csl_match),
+        "vsids_csl_match": bool(vsids_csl_match),
+        "vsids_truncated": bool(vsids.get("truncated")),
+        "csl_truncated": bool(csl.get("truncated")),
         "binary_rlimit": binary_result.get("rlimit"),
         "vsids_rlimit": vsids.get("rlimit"),
         "check_sat_loop_rlimit": csl.get("rlimit"),

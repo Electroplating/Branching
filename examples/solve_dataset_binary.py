@@ -6,8 +6,12 @@
 2. 跑 **公平 VSIDS**（``solve_omt_with_decider``，预处理 + 挂 propagator、decide 恒
    defer）得到同口径资源；
 3. 跑 **check-sat-loop**（同样预处理，但不挂 propagator）作为原 VSIDS 基线；
-4. 落盘到 ``ref/``：``value`` 始终取 binary；若公平 VSIDS 目标值与 binary 一致，
-   则缓存 ``rlimit`` 取 VSIDS 的 ``rlimit``，否则回退 binary ``rlimit``。
+4. 落盘到 ``ref/``：``value`` 始终取 binary；若公平 VSIDS 目标值与 binary 一致且
+   未截断，则缓存 ``rlimit`` 取 VSIDS 的 ``rlimit``，否则回退 binary ``rlimit``。
+
+注意：步骤 2/3 **不得**传入 ``ref_rlimit`` 剪枝。该剪枝只用于 RL/评测加速；若在
+构造参考时使用，公平 VSIDS 常被截断在次优解，导致 ``vsids.value !=
+check_sat_loop.value``（历史缓存中大量可见）。
 
 可供 ``decide_branch`` 评测臂与 RL ``binary_rlimit`` / ``binary_value`` 复用
 （含 ``train`` / ``test`` / ``eval``）。
@@ -108,7 +112,8 @@ def _solve_worker(task: tuple) -> dict:
     vsids_res: dict = {}
     csl_res: dict = {}
     if bin_res.get("status") in ("sat", "unsat") and bin_res.get("value") is not None:
-        ref_rl = bin_res.get("rlimit")
+        # 构造参考臂时禁止 ref_rlimit 剪枝：否则公平 VSIDS 易截断在次优，
+        # 与 check-sat-loop / binary 的 value 不一致。
         try:
             vsids_res = solve_omt_with_decider(
                 hard,
@@ -116,20 +121,18 @@ def _solve_worker(task: tuple) -> dict:
                 sense,
                 decider_factory=None,
                 attach_propagator=True,
-                ref_rlimit=ref_rl,
             )
         except Exception as exc:  # noqa: BLE001 — worker 内记失败，不拖垮整批
-            vsids_res = {"value": None, "error": str(exc)}
+            vsids_res = {"value": None, "error": str(exc), "truncated": False}
         try:
             csl_res = solve_omt_with_decider(
                 hard,
                 obj,
                 sense,
                 attach_propagator=False,
-                ref_rlimit=ref_rl,
             )
         except Exception as exc:  # noqa: BLE001
-            csl_res = {"value": None, "error": str(exc)}
+            csl_res = {"value": None, "error": str(exc), "truncated": False}
 
     payload = build_ref_payload(bin_res, vsids_res, csl_res)
     save_binary_result(dataset_dir, instance_id, payload, split=split)
@@ -141,6 +144,10 @@ def _solve_worker(task: tuple) -> dict:
         "rlimit": payload.get("rlimit"),
         "rlimit_source": payload.get("rlimit_source"),
         "vsids_match": payload.get("vsids_match"),
+        "csl_match": payload.get("csl_match"),
+        "vsids_csl_match": payload.get("vsids_csl_match"),
+        "vsids_truncated": payload.get("vsids_truncated"),
+        "csl_truncated": payload.get("csl_truncated"),
         "value": str(payload["value"]) if payload.get("value") is not None else None,
         "time_ms": bin_res.get("time_ms"),
     }
@@ -219,8 +226,8 @@ def main() -> None:
     )
     print(f"结果目录: {Path(args.dataset_dir) / REF_SUBDIR}/")
     print(
-        "规则: value←binary; rlimit←公平 vsids(若目标值一致) 否则←binary；"
-        "另缓存 check_sat_loop（预处理、无 propagator）"
+        "规则: value←binary; rlimit←公平 vsids(值一致且未截断) 否则←binary；"
+        "VSIDS/CSL 不传 ref_rlimit（避免截断导致 value 不一致）"
     )
 
     stats = {
@@ -230,6 +237,9 @@ def main() -> None:
         "timeout": 0,
         "vsids_rlimit": 0,
         "binary_rlimit": 0,
+        "vsids_csl_mismatch": 0,
+        "vsids_miss": 0,
+        "csl_miss": 0,
     }
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_solve_worker, t): t for t in tasks}
@@ -247,6 +257,12 @@ def main() -> None:
                         stats["vsids_rlimit"] += 1
                     else:
                         stats["binary_rlimit"] += 1
+                    if row.get("vsids_csl_match") is False:
+                        stats["vsids_csl_mismatch"] += 1
+                    if row.get("vsids_match") is False:
+                        stats["vsids_miss"] += 1
+                    if row.get("csl_match") is False:
+                        stats["csl_miss"] += 1
                 else:
                     stats["fail"] += 1
                 pbar.set_postfix(
@@ -254,6 +270,7 @@ def main() -> None:
                     ok=stats["ok"],
                     vsids_rl=stats["vsids_rlimit"],
                     bin_rl=stats["binary_rlimit"],
+                    v_csl_mm=stats["vsids_csl_mismatch"],
                     fail=stats["fail"],
                     timeout=stats["timeout"],
                 )
@@ -263,8 +280,15 @@ def main() -> None:
         f"完成: cached={stats['cached']} ok={stats['ok']} "
         f"rlimit_from_vsids={stats['vsids_rlimit']} "
         f"rlimit_from_binary={stats['binary_rlimit']} "
+        f"vsids!=csl={stats['vsids_csl_mismatch']} "
+        f"vsids!=bin={stats['vsids_miss']} csl!=bin={stats['csl_miss']} "
         f"timeout={stats['timeout']} fail={stats['fail']}"
     )
+    if stats["vsids_csl_mismatch"] or stats["vsids_miss"] or stats["csl_miss"]:
+        print(
+            "警告: 仍有臂间 value 不一致；请检查 truncated/error 字段。"
+            "旧缓存若含截断结果请加 --force 重建。"
+        )
 
 
 if __name__ == "__main__":

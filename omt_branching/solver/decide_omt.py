@@ -73,9 +73,10 @@ def solve_omt_with_decider(
       建图断言，并刷新根级 ``consequences`` 强制赋值（跨 cut 简化建图）；不额外
       ``prop.add``：单元 cut 本就不注册。
 
-    若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时提前返回（未达最优时
-    reward 侧多为 -1.0）；未给定时不做该剪枝。训练 collect 与验证均应传入参考
-    ``ref_rlimit`` 以加速无望实例。
+    若给定 ``ref_rlimit``，当前消耗超出 ``5 * ref_rlimit`` 时提前返回（未达最优时
+    reward 侧多为 -1.0，返回 dict 含 ``truncated=True``）；未给定时不做该剪枝。
+    **仅用于** learned/RL 评测加速；构造 ``ref/`` 参考缓存时必须 ``ref_rlimit=None``，
+    否则公平 VSIDS 常被截断在次优解，与 check-sat-loop / binary 的 ``value`` 不一致。
     """
     if ctx is None:
         ctx = z3.Context()
@@ -114,8 +115,10 @@ def solve_omt_with_decider(
     records = [(_num(best_val), check_rlimit[-1] + eval_rlimit[-1])]
 
     iters = 0
+    truncated = False
     for iters in range(1, max_iters + 1):
-        if ref_rlimit is not None and rlimit - solver_rlimit > 2 * ref_rlimit:
+        if ref_rlimit is not None and rlimit - solver_rlimit > 5 * ref_rlimit:
+            truncated = True
             break
         cut = obj_iso > best_val if sense is Sense.MAX else obj_iso < best_val
         s.add(cut)
@@ -139,6 +142,10 @@ def solve_omt_with_decider(
         records.append(
             (_num(best_val), model_rlimit[-1] + check_rlimit[-1] + eval_rlimit[-1])
         )
+    else:
+        # for 正常耗尽 max_iters 而未 break（未证最优）
+        if max_iters > 0:
+            truncated = True
 
     stats = {
         "value": _num(best_val),
@@ -150,6 +157,7 @@ def solve_omt_with_decider(
         "conflicts": _stat(s, "conflicts"),
         "decisions": (prop.n_decisions if prop is not None else None),
         "iters": iters,
+        "truncated": truncated,
     }
 
     weighted_rlimit = stats["rlimit"]

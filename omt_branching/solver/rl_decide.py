@@ -74,7 +74,7 @@ def decide_rl_reward(res: dict, ref_val, ref_rlimit) -> float:
         return -1.0
     # ratio = min(1.0 * weighted / ref_rlimit, 2.0)
     # return 1.0 - ratio
-    ratio = 1.0 * weighted / ref_rlimit
+    ratio = 1.0 * weighted / (2.0 * ref_rlimit)
 
     def _smooth(x: float) -> float:
         return (1 - x * x) / (1 + x * x)

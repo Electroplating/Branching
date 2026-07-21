@@ -1,7 +1,7 @@
 """四臂对比：z3 二进制 / check-sat-loop / 公平 VSIDS-decide / learned-decide。
 
 以 ``examples/artifacts/dataset`` 中 ``ref/`` 缓存为参考：最优 ``value`` 来自 binary；
-RL 用 ``rlimit`` 在公平 VSIDS 命中同一最优时取 VSIDS，否则取 binary。测量
+RL 用 ``rlimit`` 在公平 VSIDS 命中同一最优且未截断时取 VSIDS，否则取 binary。测量
 check-sat-loop / VSIDS / learned 相对参考的正确性（match）与 rlimit/conflicts/decisions。
 
 - **公平 VSIDS**：预处理 + 挂 propagator，decide 恒 defer（不 ``next_split``）；
