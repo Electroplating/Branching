@@ -459,6 +459,12 @@ def main() -> None:
         action="store_true",
         help="imitation 时若缺 look-ahead 缓存则现算并写入；默认只读已有缓存",
     )
+    ap.add_argument(
+        "--imitation-nonroot",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="objective imitation 是否纳入非根样本（默认开启；--no-imitation-nonroot 关闭）",
+    )
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument(
         "--rl-iters",
@@ -625,7 +631,8 @@ def main() -> None:
             print(
                 f"objective look-ahead 标签: {len(paths)} 实例, "
                 f"workers={lookahead_workers}, "
-                f"{'可现算缺失' if rebuild else '只读 lookahead_objective/ 缓存'}"
+                f"{'可现算缺失' if rebuild else '只读 lookahead_objective/ 缓存'}, "
+                f"nonroot={args.imitation_nonroot}"
             )
             raw_exs = build_objective_lookahead_examples_from_smt2_parallel(
                 paths,
@@ -635,6 +642,7 @@ def main() -> None:
                 split="train",
                 use_cache=True,
                 cache_only=not rebuild,
+                include_nonroot=bool(args.imitation_nonroot),
                 z3_path=z3_path,
                 opt_values=opt_values,
             )
