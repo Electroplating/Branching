@@ -230,10 +230,14 @@ def test_decide_rl_collect_batch_size():
     )
     steps = [h for h in hist if "steps" in h and "event" not in h]
     assert len(steps) == 6  # 2 iters × 3
+    assert [h["rl_iters"] for h in steps] == [0, 0, 0, 1, 1, 1]
+    assert all("better_cut_iters" in h for h in steps)
+    assert all("on_decide" in h and "next_split" in h and "defer" in h for h in steps)
     end = hist[-1]
     assert end.get("event") == "train_end"
     assert end.get("collect_batch_size") == 3
     assert end.get("sticky_window") is False
+    assert end.get("finished_iters") == 2
 
 
 def test_gpu_infer_pool_queues_slots():

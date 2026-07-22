@@ -164,8 +164,17 @@ def solve_omt_with_decider(
         "conflicts": _stat(s, "conflicts"),
         "decisions": (prop.n_decisions if prop is not None else None),
         "iters": iters,
+        "better_cut_iters": iters,
         "truncated": truncated,
     }
+    if prop is not None:
+        stats["on_decide"] = int(prop.n_on_decide)
+        stats["next_split"] = int(prop.n_next_split)
+        stats["defer"] = int(prop.n_defer)
+    else:
+        stats["on_decide"] = None
+        stats["next_split"] = None
+        stats["defer"] = None
 
     weighted_rlimit = stats["rlimit"]
     local, cost = records[0]

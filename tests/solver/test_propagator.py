@@ -34,6 +34,20 @@ def test_none_decider_falls_back():
     assert nN == 0                        # 我们没强制任何决策
 
 
+def test_decide_counters_defer_vs_next_split():
+    """on_decide = next_split + defer + empty + bad_key；故 on_decide - next_split ≠ defer。"""
+    xs, clauses = _sat_instance()
+    s = z3.Solver()
+    p = LearnedDecidePropagator(s, xs, lambda und, asg: None)
+    s.add(*clauses)
+    assert s.check() == z3.sat
+    assert p.n_next_split == 0
+    assert p.n_on_decide == (
+        p.n_next_split + p.n_defer + p._counters.empty + p._counters.bad_key
+    )
+    assert p.n_on_decide - p.n_next_split == p.n_defer + p._counters.empty + p._counters.bad_key
+
+
 def test_pop_notifies_decider_on_backtrack():
     """propagator.pop 会调用 decider.on_backtrack(num_scopes)。"""
     xs, clauses = _sat_instance()

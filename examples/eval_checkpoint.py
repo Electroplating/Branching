@@ -136,6 +136,10 @@ def main() -> None:
         "weighted rlimit": 0.0,
         "conflicts": 0.0,
         "decisions": 0.0,
+        "on_decide": 0.0,
+        "next_split": 0.0,
+        "defer": 0.0,
+        "better_cut_iters": 0.0,
         "match": 0.0,
     }
     agg = {

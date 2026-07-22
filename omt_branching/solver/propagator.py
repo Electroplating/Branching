@@ -2,18 +2,47 @@
 布尔分支决策**（不改 z3）。decider 不自信（返回 None）时直接放行 -> 退回 z3 原生 VSIDS。
 
 注意：基类占用属性名 ``fixed``/``decide``，本类用 ``_val``/``_on_decide`` 等避让。
+
+计数（``fresh`` 副本共享同一对象，便于汇总）::
+
+- ``n_on_decide``：``_on_decide`` 回调次数；
+- ``n_next_split`` / ``n_decisions``：实际 ``next_split`` 次数（GNN override）；
+- ``n_defer``：decider 返回 ``None``、放行 VSIDS 的次数。
+
+``n_on_decide - n_next_split`` **不等于** ``n_defer``：前者还含「无未定原子」
+与「非法 key」等早退，故 ``n_defer`` 单独累计。
 """
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Optional
 
 import z3
 
 from omt_branching.solver.propagator_snapshot import atom_key
 
 
+class _DecideCounters:
+    """可变计数器；``fresh()`` 后各 propagator 实例共享同一对象。"""
+
+    __slots__ = ("on_decide", "next_split", "defer", "empty", "bad_key")
+
+    def __init__(self) -> None:
+        self.on_decide = 0
+        self.next_split = 0
+        self.defer = 0
+        self.empty = 0
+        self.bad_key = 0
+
+
 class LearnedDecidePropagator(z3.UserPropagateBase):
-    def __init__(self, s, atoms, decider: Callable):
+    def __init__(
+        self,
+        s,
+        atoms,
+        decider: Callable,
+        *,
+        _counters: Optional[_DecideCounters] = None,
+    ):
         super().__init__(s)
         self.atoms = list(atoms)
         self.key2atom = {atom_key(a): a for a in self.atoms}
@@ -25,11 +54,32 @@ class LearnedDecidePropagator(z3.UserPropagateBase):
         self._val: dict = {}          # key -> bool（当前赋值）
         self._trail: list = []
         self._lim: list = []
-        self.n_decisions = 0
+        self._counters = _counters if _counters is not None else _DecideCounters()
         self.add_fixed(self._on_fixed)
         self.add_decide(self._on_decide)
         for a in self.atoms:
             self.add(a)               # 注册原子，z3 才会在其上回调 decide
+
+    @property
+    def n_on_decide(self) -> int:
+        return self._counters.on_decide
+
+    @property
+    def n_next_split(self) -> int:
+        return self._counters.next_split
+
+    @property
+    def n_defer(self) -> int:
+        return self._counters.defer
+
+    @property
+    def n_decisions(self) -> int:
+        """兼容旧名：等同 ``n_next_split``。"""
+        return self._counters.next_split
+
+    @n_decisions.setter
+    def n_decisions(self, value: int) -> None:
+        self._counters.next_split = int(value)
 
     def push(self):
         self._lim.append(len(self._trail))
@@ -45,7 +95,9 @@ class LearnedDecidePropagator(z3.UserPropagateBase):
             on_bt(num_scopes)
 
     def fresh(self, new_ctx):
-        return LearnedDecidePropagator(new_ctx, self.atoms, self.decider)
+        return LearnedDecidePropagator(
+            new_ctx, self.atoms, self.decider, _counters=self._counters
+        )
 
     def _on_fixed(self, t, v):
         # get_id() 命中已注册原子（z3 只对 add 过的项回调 fixed），避免 str(t)。
@@ -55,19 +107,23 @@ class LearnedDecidePropagator(z3.UserPropagateBase):
             self._trail.append(k)
 
     def _on_decide(self, t, idx, phase):
+        self._counters.on_decide += 1
         undecided = [k for k in self.key2atom if k not in self._val]
         if not undecided:
+            self._counters.empty += 1
             return
         # self._val 只读传给 decider（各 decider 仅在 refocus 时即时读取、不留引用、不改），
         # 免去每次 decide 一次 dict 拷贝。
         choice = self.decider(undecided, self._val)
         if choice is None:
+            self._counters.defer += 1
             return                    # 退回 VSIDS
         key, ph = choice
         atom = self.key2atom.get(key)
         if atom is None:
+            self._counters.bad_key += 1
             return
-        self.n_decisions += 1
+        self._counters.next_split += 1
         # z3 next_split 的 phase 是 Z3_lbool：真=1，假=-1，未定=0（≠ Python bool）
         z3_phase = z3.Z3_L_TRUE if ph else z3.Z3_L_FALSE
         self.next_split(atom, 0, z3_phase)

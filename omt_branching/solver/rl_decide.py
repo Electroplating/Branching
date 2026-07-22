@@ -391,6 +391,25 @@ def _rl_collect_worker(task: tuple) -> tuple:
     return inst_idx, _steps_to_cpu(steps), reward, res
 
 
+def _history_episode_fields(rl_iters: int, instance: int, res: dict) -> dict:
+    """写入 RL history 的 episode 侧字段（与 REINFORCE ``steps`` 并列）。"""
+    return {
+        "rl_iters": int(rl_iters),
+        "better_cut_iters": res.get("better_cut_iters", res.get("iters")),
+        "instance": int(instance),
+        "rlimit": res.get("rlimit"),
+        "conflicts": res.get("conflicts"),
+        "ref_rlimit": res.get("ref_rlimit"),
+        "on_decide": res.get("on_decide"),
+        "next_split": res.get("next_split", res.get("decisions")),
+        "defer": res.get("defer"),
+        "match": (
+            res.get("ref_value") is None
+            or res.get("value") == res.get("ref_value")
+        ),
+    }
+
+
 class SamplingPolicyDecider:
     def __init__(
         self,
@@ -829,21 +848,36 @@ class DecideRLTrainer:
                 )
                 stats = self.update(steps, reward, key=j)
                 stats.update({
-                    "iter": it, "instance": j, "conflicts": res["conflicts"],
-                    "ref_conflicts": refs[j], "reward": reward,
+                    "rl_iters": it,
+                    "instance": j,
+                    "conflicts": res["conflicts"],
+                    "ref_conflicts": refs[j],
+                    "reward": reward,
+                    "on_decide": res.get("on_decide"),
+                    "next_split": res.get("next_split", res.get("decisions")),
+                    "defer": res.get("defer"),
                 })
                 history.append(stats)
                 if log:
                     print(
-                        f"[it {it} inst {j}] loss={stats['loss']:.4f} reward={reward:.3f} "
-                        f"conflicts={res['conflicts']} ref={refs[j]} steps={stats['steps']}"
+                        f"[rl_iters {it} inst {j}] loss={stats['loss']:.4f} "
+                        f"reward={reward:.3f} conflicts={res['conflicts']} "
+                        f"ref={refs[j]} steps={stats['steps']} "
+                        f"on_decide={stats.get('on_decide')} "
+                        f"next_split={stats.get('next_split')} "
+                        f"defer={stats.get('defer')}"
                     )
         return history
 
     def update(self, steps, reward, key) -> dict:
         if not steps:
             self._update_baseline_for(key, reward)
-            return {"loss": 0.0, "reward": reward, "steps": 0}
+            return {
+                "loss": 0.0,
+                "reward": reward,
+                "steps": 0,
+                "advantage": 0.0,
+            }
         adv = reward - self._baseline_for(key)
         cache: dict = {}
         loss = torch.zeros((), device=self.config.device)
@@ -871,7 +905,12 @@ class DecideRLTrainer:
         )
         self.opt.step()
         self._update_baseline_for(key, reward)
-        return {"loss": float(loss), "reward": reward, "steps": n}
+        return {
+            "loss": float(loss.detach()),
+            "reward": reward,
+            "steps": n,
+            "advantage": float(adv),
+        }
 
     def train(
         self,
@@ -1015,28 +1054,20 @@ class DecideRLTrainer:
                         )
                         for upd_i, (j, steps, reward, res) in enumerate(batch):
                             stats = self.update(steps, reward, key=j)
-                            stats.update(
-                                {
-                                    "iter": it,
-                                    "instance": j,
-                                    "rlimit": res["rlimit"],
-                                    "conflicts": res["conflicts"],
-                                    "ref_rlimit": res.get("ref_rlimit"),
-                                    "match": (
-                                        res.get("ref_value") is None
-                                        or res.get("value") == res.get("ref_value")
-                                    ),
-                                }
-                            )
+                            stats.update(_history_episode_fields(it, j, res))
                             history.append(stats)
                             if log:
                                 print(
-                                    f"[it {it} inst {j}] loss={stats['loss']:.4f} "
+                                    f"[rl_iters {it} inst {j}] loss={stats['loss']:.4f} "
                                     f"reward={reward:.3f} rlimit={res['rlimit']} "
-                                    f"conflicts={res['conflicts']} steps={stats['steps']}"
+                                    f"conflicts={res['conflicts']} steps={stats['steps']} "
+                                    f"better_cut={stats.get('better_cut_iters')} "
+                                    f"on_decide={stats.get('on_decide')} "
+                                    f"next_split={stats.get('next_split')} "
+                                    f"defer={stats.get('defer')}"
                                 )
                             pbar.set_postfix(
-                                iter=it,
+                                rl_iters=it,
                                 phase="update",
                                 inst=f"{upd_i + 1}/{len(indices)}",
                             )
@@ -1051,25 +1082,17 @@ class DecideRLTrainer:
                                 ref_rlimit=rls[j],
                             )
                             stats = self.update(steps, reward, key=j)
-                            stats.update(
-                                {
-                                    "iter": it,
-                                    "instance": j,
-                                    "rlimit": res["rlimit"],
-                                    "conflicts": res["conflicts"],
-                                    "ref_rlimit": res.get("ref_rlimit"),
-                                    "match": (
-                                        res.get("ref_value") is None
-                                        or res.get("value") == res.get("ref_value")
-                                    ),
-                                }
-                            )
+                            stats.update(_history_episode_fields(it, j, res))
                             history.append(stats)
                             if log:
                                 print(
-                                    f"[it {it} inst {j}] loss={stats['loss']:.4f} "
+                                    f"[rl_iters {it} inst {j}] loss={stats['loss']:.4f} "
                                     f"reward={reward:.3f} rlimit={res['rlimit']} "
-                                    f"conflicts={res['conflicts']} steps={stats['steps']}"
+                                    f"conflicts={res['conflicts']} steps={stats['steps']} "
+                                    f"better_cut={stats.get('better_cut_iters')} "
+                                    f"on_decide={stats.get('on_decide')} "
+                                    f"next_split={stats.get('next_split')} "
+                                    f"defer={stats.get('defer')}"
                                 )
                             pbar.update(1)
                     finished_iters = it + 1

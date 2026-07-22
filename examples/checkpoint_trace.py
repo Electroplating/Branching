@@ -34,10 +34,10 @@ DEFAULT_LOG = os.path.join(ARTIFACTS, "checkpoint_trace.log")
 
 
 class TracingDecidePropagator(LearnedDecidePropagator):
-    """在 ``_on_decide`` 中记录并实时写出决策原子；逻辑与父类一致。"""
+    """在 ``_on_decide`` 中记录并实时写出决策原子；计数走父类共享 ``_counters``。"""
 
-    def __init__(self, s, atoms, decider, *, log_fp, seq_holder: list):
-        super().__init__(s, atoms, decider)
+    def __init__(self, s, atoms, decider, *, log_fp, seq_holder: list, _counters=None):
+        super().__init__(s, atoms, decider, _counters=_counters)
         self._log_fp = log_fp
         # 与 fresh() 副本共享同一计数器（单元素 list）
         self._seq_holder = seq_holder
@@ -49,6 +49,7 @@ class TracingDecidePropagator(LearnedDecidePropagator):
             self.decider,
             log_fp=self._log_fp,
             seq_holder=self._seq_holder,
+            _counters=self._counters,
         )
 
     def _emit(self, *, source: str, atom: str, phase: bool, n_undecided: int) -> None:
@@ -61,11 +62,14 @@ class TracingDecidePropagator(LearnedDecidePropagator):
         self._log_fp.flush()
 
     def _on_decide(self, t, idx, phase):
+        self._counters.on_decide += 1
         undecided = [k for k in self.key2atom if k not in self._val]
         if not undecided:
+            self._counters.empty += 1
             return
         choice = self.decider(undecided, self._val)
         if choice is None:
+            self._counters.defer += 1
             # 退回 VSIDS：记录 z3 拟分裂的文字（若落在已注册原子上）
             vsids_key = self._id2key.get(t.get_id())
             atom_s = vsids_key if vsids_key is not None else t.sexpr()
@@ -80,6 +84,7 @@ class TracingDecidePropagator(LearnedDecidePropagator):
         key, ph = choice
         atom = self.key2atom.get(key)
         if atom is None:
+            self._counters.bad_key += 1
             return
         self._emit(
             source="gnn",
@@ -87,7 +92,7 @@ class TracingDecidePropagator(LearnedDecidePropagator):
             phase=bool(ph),
             n_undecided=len(undecided),
         )
-        self.n_decisions += 1
+        self._counters.next_split += 1
         z3_phase = z3.Z3_L_TRUE if ph else z3.Z3_L_FALSE
         self.next_split(atom, 0, z3_phase)
 
@@ -210,7 +215,9 @@ def main() -> None:
         f"consequence={stats.get('consequence rlimit')} "
         f"rlimit+cons={stats.get('rlimit with consequence')} "
         f"weighted={stats.get('weighted rlimit')} conflicts={stats.get('conflicts')} "
-        f"decisions={stats.get('decisions')} iters={stats.get('iters')} "
+        f"better_cut_iters={stats.get('better_cut_iters')} "
+        f"on_decide={stats.get('on_decide')} next_split={stats.get('next_split')} "
+        f"defer={stats.get('defer')} "
         f"truncated={stats.get('truncated')} log_lines={seq_holder[0]}"
     )
 

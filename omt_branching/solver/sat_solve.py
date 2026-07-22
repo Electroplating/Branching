@@ -30,6 +30,9 @@ def solve_sat_with_decider(assertions, atoms, decider_factory=None) -> dict:
         "result": "sat" if res == z3.sat else ("unsat" if res == z3.unsat else "unknown"),
         "conflicts": _stat(s, "conflicts"),
         "decisions": prop.n_decisions,
+        "on_decide": prop.n_on_decide,
+        "next_split": prop.n_next_split,
+        "defer": prop.n_defer,
         "rlimit": _stat(s, "rlimit count"),
     }
 
