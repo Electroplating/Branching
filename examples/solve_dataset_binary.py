@@ -9,7 +9,7 @@
 4. 落盘到 ``ref/``：``value`` 始终取 binary；若公平 VSIDS 目标值与 binary 一致且
    未截断，则缓存 ``rlimit`` 取 VSIDS 的 ``rlimit``，否则回退 binary ``rlimit``。
 
-注意：步骤 2/3 **不得**传入 ``ref_rlimit`` 剪枝。该剪枝只用于 RL/评测加速；若在
+注意：步骤 2/3 **不得**传入 ``ref_rlimit`` 剪枝。该剪枝只用于 RL collect / 验证加速；若在
 构造参考时使用，公平 VSIDS 常被截断在次优解，导致 ``vsids.value !=
 check_sat_loop.value``（历史缓存中大量可见）。
 

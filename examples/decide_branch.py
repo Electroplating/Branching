@@ -416,7 +416,11 @@ def _eval_policy_and_factory(
 
 
 def _eval_test_worker(task: tuple) -> dict:
-    """ProcessPool worker：ref 缓存取 binary/VSIDS/check-sat-loop，现场只跑 learned。"""
+    """ProcessPool worker：ref 缓存取 binary/VSIDS/check-sat-loop，现场只跑 learned。
+
+    测试集**不传** ``ref_rlimit``（不做超限截断），以便完整求解统计；
+    RL collect / 验证集仍传 ``ref_rlimit`` 加速。
+    """
     (
         smt2_path,
         instance_id,
@@ -434,9 +438,6 @@ def _eval_test_worker(task: tuple) -> dict:
     inst = smt2_to_instance(smt2_path, instance_id=instance_id)
     hard, obj, sense = inst.as_tuple()
     ref_val = ref_cache.get("value")
-    ref_rl = ref_cache.get("rlimit")
-    if ref_rl is not None:
-        ref_rl = int(ref_rl)
     bin_stats = binary_stats_from_ref(ref_cache)
     v = vsids_stats_from_ref(ref_cache)
     csl = check_sat_loop_stats_from_ref(ref_cache)
@@ -454,7 +455,7 @@ def _eval_test_worker(task: tuple) -> dict:
         obj,
         sense,
         decider_factory=factory,
-        ref_rlimit=ref_rl,
+        ref_rlimit=None,
     )
     return {
         "instance_id": inst.instance_id,
@@ -467,7 +468,10 @@ def _eval_test_worker(task: tuple) -> dict:
 
 
 def _eval_val_worker(task: tuple) -> dict:
-    """验证集 worker：只跑 learned 臂，返回 reward / weighted rlimit / match。"""
+    """验证集 worker：只跑 learned 臂，返回 reward / weighted rlimit / match。
+
+    传入 ``ref_rlimit``：超出 ``2 * ref`` 时截断（与 RL collect 一致，仅加速验证）。
+    """
     (
         smt2_path,
         instance_id,
@@ -611,6 +615,7 @@ def _run_test_parallel(
     """并发跑测试集；workers>1 时 GNN 在主进程 GPU 上推理（与 RL collect 同构）。
 
     ``sample`` 默认 False（argmax）；True 时与 collect 同分布概率采样。
+    不做 ``ref_rlimit`` 截断（完整求解）；验证/RL 采样另见 ``_run_val_parallel``。
     """
     n_workers = max(1, min(workers, len(entries)))
     # 多进程或复用训练期 GpuInferService 时走远程 GPU；单进程本地直接用 device

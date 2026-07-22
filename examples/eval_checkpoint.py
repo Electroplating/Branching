@@ -2,7 +2,8 @@
 
 评测逻辑与 ``examples/decide_branch.py`` 一致（``SamplingPolicyDecider``；
 默认 ``sample=False``/argmax，``--test-sample`` 改为概率采样；允许 defer；
-ref 缓存参考），不训练。默认权重 ``examples/artifacts/rl_decide_policy.pt``，
+ref 缓存参考），不训练。**不做** ``ref_rlimit`` 超限截断（完整求解）；该截断
+仅用于 RL collect / 验证。默认权重 ``examples/artifacts/rl_decide_policy.pt``，
 默认数据 ``examples/artifacts/dataset``。
 
 运行::
