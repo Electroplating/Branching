@@ -25,6 +25,7 @@ from omt_branching.solver.decide_omt import solve_omt_with_decider
 from omt_branching.solver.interfaces import Sense
 from omt_branching.solver.propagator_snapshot import (
     build_bool_snapshot,
+    merge_assignment_trail,
     merge_root_assignment,
     root_forced_assignment,
 )
@@ -76,9 +77,12 @@ class PolicyDecider:
         if self.refocus_on_backtrack:
             self.force_refocus()
 
-    def _refocus(self, assignment):
+    def _refocus(self, assignment, trail=None):
         asg = merge_root_assignment(self._root_fixed, assignment)
-        snap, _ = build_bool_snapshot(self.assertions, assignment=asg)
+        ordered = merge_assignment_trail(self._root_fixed, assignment, trail)
+        snap, _ = build_bool_snapshot(
+            self.assertions, assignment=asg, trail=ordered
+        )
         try:
             advice = self.service.advise(snap)
         except Exception:
@@ -90,9 +94,9 @@ class PolicyDecider:
         self._pri = dict(advice.activity_priors)
         self._phase = dict(advice.phase_suggestions)
 
-    def __call__(self, undecided_keys, assignment) -> Optional[tuple]:
+    def __call__(self, undecided_keys, assignment, trail=None) -> Optional[tuple]:
         if self._since >= self.refocus_every:
-            self._refocus(assignment)
+            self._refocus(assignment, trail)
             self._since = 0
         self._since += 1
         if not self._pri:

@@ -56,7 +56,7 @@ def generate_hard_smt_lia(n_vars: int = 8, n_disj: int = 30, k: int = 3,
             b = rng.randint(-ub, ub * chi)
             lits.append(lhs <= b if rng.random() < 0.5 else lhs >= b)
         clauses.append(z3.Or(*lits))
-    # 仅析取子句原子（与 LearnedDecidePropagator 注册策略一致）
+    # SAT harness 传入的 atoms 即分支候选（纯布尔子句下与全量原子一致）
     atoms = collect_clause_atoms(clauses)
     return atoms, clauses
 

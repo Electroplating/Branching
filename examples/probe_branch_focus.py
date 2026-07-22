@@ -54,7 +54,7 @@ def _priority_decider_factory(priority: list[tuple[str, bool]]):
         rank = {k: i for i, (k, _) in enumerate(prio)}
         phase_of = dict(prio)
 
-        def decider(undecided, _assignment):
+        def decider(undecided, _assignment, _trail=None):
             best_k, best_r = None, 10**9
             for k in undecided:
                 r = rank.get(k)

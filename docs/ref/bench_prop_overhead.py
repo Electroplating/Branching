@@ -148,10 +148,11 @@ def main():
         sense=Sense.MAX,
     )
     hard, obj, sense = inst.as_tuple()
-    pp, reg_atoms = prepare_propagator_formula(hard)
+    pp, watch_atoms, branch_atoms = prepare_propagator_formula(hard)
     print(f"实例：{len(inst.variables)} vars, {len(hard)} hard, "
-          f"预处理后 {len(pp)} 断言, 注册原子 {len(reg_atoms)}")
+          f"预处理后 {len(pp)} 断言, watch {len(watch_atoms)}, branch {len(branch_atoms)}")
 
+    reg_atoms = watch_atoms  # 基准：全量 watch 注册
     arms = [
         ("none_raw", hard, None),
         ("none_pp", pp, None),

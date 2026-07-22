@@ -36,8 +36,20 @@ DEFAULT_LOG = os.path.join(ARTIFACTS, "checkpoint_trace.log")
 class TracingDecidePropagator(LearnedDecidePropagator):
     """在 ``_on_decide`` 中记录并实时写出决策原子；计数走父类共享 ``_counters``。"""
 
-    def __init__(self, s, atoms, decider, *, log_fp, seq_holder: list, _counters=None):
-        super().__init__(s, atoms, decider, _counters=_counters)
+    def __init__(
+        self,
+        s,
+        atoms,
+        decider,
+        *,
+        log_fp,
+        seq_holder: list,
+        branch_atoms=None,
+        _counters=None,
+    ):
+        super().__init__(
+            s, atoms, decider, branch_atoms=branch_atoms, _counters=_counters
+        )
         self._log_fp = log_fp
         # 与 fresh() 副本共享同一计数器（单元素 list）
         self._seq_holder = seq_holder
@@ -49,6 +61,7 @@ class TracingDecidePropagator(LearnedDecidePropagator):
             self.decider,
             log_fp=self._log_fp,
             seq_holder=self._seq_holder,
+            branch_atoms=self.branch_atoms,
             _counters=self._counters,
         )
 
@@ -63,14 +76,14 @@ class TracingDecidePropagator(LearnedDecidePropagator):
 
     def _on_decide(self, t, idx, phase):
         self._counters.on_decide += 1
-        undecided = [k for k in self.key2atom if k not in self._val]
-        if not undecided:
+        if not self._undecided:
             self._counters.empty += 1
             return
-        choice = self.decider(undecided, self._val)
+        undecided = sorted(self._undecided)
+        choice = self.decider(undecided, self._ordered_assignment(), self._trail)
         if choice is None:
             self._counters.defer += 1
-            # 退回 VSIDS：记录 z3 拟分裂的文字（若落在已注册原子上）
+            # 退回 VSIDS：记录 z3 拟分裂的文字（若落在已 watch 原子上）
             vsids_key = self._id2key.get(t.get_id())
             atom_s = vsids_key if vsids_key is not None else t.sexpr()
             ph = int(phase) == int(z3.Z3_L_TRUE)
@@ -83,7 +96,7 @@ class TracingDecidePropagator(LearnedDecidePropagator):
             return
         key, ph = choice
         atom = self.key2atom.get(key)
-        if atom is None:
+        if atom is None or key not in self.branch_keys:
             self._counters.bad_key += 1
             return
         self._emit(
@@ -195,9 +208,14 @@ def main() -> None:
         )
         log_fp.flush()
 
-        def propagator_factory(s, atoms, decider):
+        def propagator_factory(s, atoms, decider, branch_atoms=None):
             return TracingDecidePropagator(
-                s, atoms, decider, log_fp=log_fp, seq_holder=seq_holder
+                s,
+                atoms,
+                decider,
+                log_fp=log_fp,
+                seq_holder=seq_holder,
+                branch_atoms=branch_atoms,
             )
 
         stats = solve_omt_with_decider(

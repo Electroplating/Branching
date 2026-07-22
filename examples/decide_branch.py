@@ -29,6 +29,7 @@ from fractions import Fraction
 from pathlib import Path
 
 import torch
+import torch.multiprocessing as mp
 
 from omt_branching.model.device import gnn_device
 from omt_branching.model.persistence import load_policy_into, save_history, save_policy
@@ -38,10 +39,14 @@ from omt_branching.solver.rl_decide import (
     DecideRLConfig,
     DecideRLTrainer,
     EarlyStopConfig,
+    GpuInferService,
+    RemoteInferClient,
     SamplingPolicyDecider,
+    _make_rl_process_pool,
     decide_rl_reward,
     effective_rl_workers,
 )
+from omt_branching.solver import rl_decide as _rl_decide
 from omt_branching.solver import (
     load_dataset,
     list_split_entries,
@@ -338,8 +343,13 @@ def _make_eval_decider_factory(
     refocus: int,
     defer_logit: float,
     sticky_window: bool,
+    *,
+    infer_pool=None,
 ):
-    """验证/测试：与训练同构的 SamplingPolicyDecider，``sample=False``（可 defer）。"""
+    """验证/测试：与训练同构的 SamplingPolicyDecider，``sample=False``（可 defer）。
+
+    ``infer_pool`` 非空时 GNN 走主进程 GPU 服务，本进程仅用 CPU 占位策略。
+    """
     defer = torch.nn.Parameter(
         torch.tensor(float(defer_logit), dtype=torch.float32, device=device)
     )
@@ -353,9 +363,50 @@ def _make_eval_decider_factory(
             sample=False,
             device=device,
             sticky_window=sticky_window,
+            infer_pool=infer_pool,
         )
 
     return factory
+
+
+def _eval_policy_and_factory(
+    policy_state: dict | None,
+    device: str,
+    refocus: int,
+    defer_logit: float,
+    sticky_window: bool,
+    *,
+    use_remote: bool,
+):
+    """构造 eval 用 policy + decider_factory（本地 GPU 或远程 GpuInferService）。"""
+    if use_remote:
+        # 必须读模块全局：initializer 更新的是 rl_decide._INFER_REQ，
+        # 不能用 from-import 绑到的旧引用（恒为 None）。
+        if _rl_decide._INFER_REQ is None:
+            raise RuntimeError("eval worker 未初始化远程 infer（缺少 initializer）")
+        policy = BranchingPolicy()
+        policy.eval()
+        client = RemoteInferClient(_rl_decide._INFER_REQ, _rl_decide._MP_CTX)
+        factory = _make_eval_decider_factory(
+            policy,
+            "cpu",
+            refocus,
+            defer_logit,
+            sticky_window,
+            infer_pool=client,
+        )
+        return policy, factory
+
+    if policy_state is None:
+        raise RuntimeError("本地 eval 需要 policy_state")
+    policy = BranchingPolicy()
+    policy.load_state_dict(policy_state)
+    policy.to(device)
+    policy.eval()
+    factory = _make_eval_decider_factory(
+        policy, device, refocus, defer_logit, sticky_window
+    )
+    return policy, factory
 
 
 def _eval_test_worker(task: tuple) -> dict:
@@ -369,6 +420,7 @@ def _eval_test_worker(task: tuple) -> dict:
         refocus,
         defer_logit,
         sticky_window,
+        use_remote,
     ) = task
     from omt_branching.solver.decide_omt import smt2_to_instance
 
@@ -381,17 +433,19 @@ def _eval_test_worker(task: tuple) -> dict:
     bin_stats = binary_stats_from_ref(ref_cache)
     v = vsids_stats_from_ref(ref_cache)
     csl = check_sat_loop_stats_from_ref(ref_cache)
-    policy = BranchingPolicy()
-    policy.load_state_dict(policy_state)
-    policy.to(device)
-    policy.eval()
+    _, factory = _eval_policy_and_factory(
+        policy_state,
+        device,
+        refocus,
+        defer_logit,
+        sticky_window,
+        use_remote=bool(use_remote),
+    )
     ln = solve_omt_with_decider(
         hard,
         obj,
         sense,
-        decider_factory=_make_eval_decider_factory(
-            policy, device, refocus, defer_logit, sticky_window
-        ),
+        decider_factory=factory,
         ref_rlimit=ref_rl,
     )
     return {
@@ -415,6 +469,7 @@ def _eval_val_worker(task: tuple) -> dict:
         refocus,
         defer_logit,
         sticky_window,
+        use_remote,
     ) = task
     from omt_branching.solver.decide_omt import smt2_to_instance
 
@@ -425,17 +480,19 @@ def _eval_val_worker(task: tuple) -> dict:
     ref_rl = ref.get("rlimit")
     if ref_rl is not None:
         ref_rl = int(ref_rl)
-    policy = BranchingPolicy()
-    policy.load_state_dict(policy_state)
-    policy.to(device)
-    policy.eval()
+    _, factory = _eval_policy_and_factory(
+        policy_state,
+        device,
+        refocus,
+        defer_logit,
+        sticky_window,
+        use_remote=bool(use_remote),
+    )
     ln = solve_omt_with_decider(
         hard,
         obj,
         sense,
-        decider_factory=_make_eval_decider_factory(
-            policy, device, refocus, defer_logit, sticky_window
-        ),
+        decider_factory=factory,
         ref_rlimit=ref_rl,
     )
     reward = decide_rl_reward(ln, ref_val, ref_rl)
@@ -453,92 +510,7 @@ def _policy_state_cpu(policy: BranchingPolicy) -> dict:
     return {k: v.detach().cpu() for k, v in policy.state_dict().items()}
 
 
-def _run_test_parallel(
-    entries: list[dict],
-    dataset_dir: str,
-    policy: BranchingPolicy,
-    device: str,
-    refocus: int,
-    workers: int,
-    *,
-    split: str = "test",
-    defer_logit: float = 0.0,
-    sticky_window: bool = False,
-) -> list[dict]:
-    """并发跑测试集（进程池；binary 读缓存；每 worker 从 smt2 加载）。"""
-    policy_state = _policy_state_cpu(policy)
-    n_workers = max(1, min(workers, len(entries)))
-    worker_device = device if n_workers == 1 else "cpu"
-    root = Path(dataset_dir)
-    tasks = []
-    for e in entries:
-        iid = e["instance_id"]
-        cached = load_binary_result(dataset_dir, iid, split=split)
-        if cached is None:
-            raise RuntimeError(f"缺少 ref 缓存 ({split}): {iid}")
-        tasks.append((
-            str(root / e["smt2"]),
-            iid,
-            cached,
-            policy_state,
-            worker_device,
-            refocus,
-            float(defer_logit),
-            bool(sticky_window),
-        ))
-    by_id: dict[str, dict] = {}
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_eval_test_worker, t): t[1] for t in tasks}
-        with tqdm(total=len(entries), desc=split) as pbar:
-            for fut in as_completed(futures):
-                row = fut.result()
-                by_id[row["instance_id"]] = row
-                pbar.update(1)
-    return [by_id[e["instance_id"]] for e in entries]
-
-
-def _run_val_parallel(
-    entries: list[dict],
-    dataset_dir: str,
-    policy: BranchingPolicy,
-    device: str,
-    refocus: int,
-    workers: int,
-    *,
-    split: str = "eval",
-    defer_logit: float = 0.0,
-    sticky_window: bool = False,
-) -> dict:
-    """在验证集上评估 learned 臂，返回聚合指标（供早停）。"""
-    if not entries:
-        raise ValueError("验证集条目为空")
-    policy_state = _policy_state_cpu(policy)
-    n_workers = max(1, min(workers, len(entries)))
-    worker_device = device if n_workers == 1 else "cpu"
-    root = Path(dataset_dir)
-    tasks = []
-    for e in entries:
-        iid = e["instance_id"]
-        cached = load_binary_result(dataset_dir, iid, split=split)
-        if cached is None:
-            raise RuntimeError(f"缺少 ref 缓存 ({split}): {iid}")
-        tasks.append((
-            str(root / e["smt2"]),
-            iid,
-            cached,
-            policy_state,
-            worker_device,
-            refocus,
-            float(defer_logit),
-            bool(sticky_window),
-        ))
-    rows: list[dict] = []
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = [pool.submit(_eval_val_worker, t) for t in tasks]
-        with tqdm(total=len(entries), desc=f"val/{split}") as pbar:
-            for fut in as_completed(futures):
-                rows.append(fut.result())
-                pbar.update(1)
+def _aggregate_val_rows(rows: list[dict]) -> dict:
     n = max(1, len(rows))
     mean_reward = sum(float(r["reward"]) for r in rows) / n
     wr = [
@@ -554,6 +526,167 @@ def _run_val_parallel(
         "match_rate": match_rate,
         "n": len(rows),
     }
+
+
+def _run_eval_tasks(
+    tasks: list[tuple],
+    *,
+    worker_fn,
+    n_workers: int,
+    use_remote: bool,
+    policy: BranchingPolicy,
+    device: str,
+    desc: str,
+    infer_service: GpuInferService | None = None,
+    use_all_gpus: bool = True,
+) -> list[dict]:
+    """串行本地 GPU，或 spawn 进程池 + 主进程 GpuInferService 远程推理。"""
+    if not use_remote:
+        rows: list[dict] = []
+        with tqdm(total=len(tasks), desc=desc) as pbar:
+            for t in tasks:
+                rows.append(worker_fn(t))
+                pbar.update(1)
+        return rows
+
+    ctx = mp.get_context("spawn")
+    own_service = False
+    svc = infer_service
+    if svc is None:
+        req_queue = ctx.Queue()
+        svc = GpuInferService.from_policy(
+            policy,
+            req_queue,
+            device=device,
+            use_all_gpus=use_all_gpus,
+        )
+        svc.start()
+        own_service = True
+    else:
+        req_queue = svc.req_queue
+        svc.sync_from(policy)
+
+    pool: ProcessPoolExecutor | None = None
+    try:
+        pool = _make_rl_process_pool(n_workers, req_queue, ctx)
+        rows = []
+        futures = [pool.submit(worker_fn, t) for t in tasks]
+        with tqdm(total=len(tasks), desc=desc) as pbar:
+            for fut in as_completed(futures):
+                rows.append(fut.result())
+                pbar.update(1)
+        return rows
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=False)
+        if own_service and svc is not None:
+            svc.stop()
+
+
+def _run_test_parallel(
+    entries: list[dict],
+    dataset_dir: str,
+    policy: BranchingPolicy,
+    device: str,
+    refocus: int,
+    workers: int,
+    *,
+    split: str = "test",
+    defer_logit: float = 0.0,
+    sticky_window: bool = False,
+    infer_service: GpuInferService | None = None,
+    use_all_gpus: bool = True,
+) -> list[dict]:
+    """并发跑测试集；workers>1 时 GNN 在主进程 GPU 上推理（与 RL collect 同构）。"""
+    n_workers = max(1, min(workers, len(entries)))
+    # 多进程或复用训练期 GpuInferService 时走远程 GPU；单进程本地直接用 device
+    use_remote = n_workers > 1 or infer_service is not None
+    policy_state = None if use_remote else _policy_state_cpu(policy)
+    worker_device = "cpu" if use_remote else device
+    root = Path(dataset_dir)
+    tasks = []
+    for e in entries:
+        iid = e["instance_id"]
+        cached = load_binary_result(dataset_dir, iid, split=split)
+        if cached is None:
+            raise RuntimeError(f"缺少 ref 缓存 ({split}): {iid}")
+        tasks.append((
+            str(root / e["smt2"]),
+            iid,
+            cached,
+            policy_state,
+            worker_device,
+            refocus,
+            float(defer_logit),
+            bool(sticky_window),
+            use_remote,
+        ))
+    rows = _run_eval_tasks(
+        tasks,
+        worker_fn=_eval_test_worker,
+        n_workers=n_workers,
+        use_remote=use_remote,
+        policy=policy,
+        device=device,
+        desc=split,
+        infer_service=infer_service,
+        use_all_gpus=use_all_gpus,
+    )
+    by_id = {row["instance_id"]: row for row in rows}
+    return [by_id[e["instance_id"]] for e in entries]
+
+
+def _run_val_parallel(
+    entries: list[dict],
+    dataset_dir: str,
+    policy: BranchingPolicy,
+    device: str,
+    refocus: int,
+    workers: int,
+    *,
+    split: str = "eval",
+    defer_logit: float = 0.0,
+    sticky_window: bool = False,
+    infer_service: GpuInferService | None = None,
+    use_all_gpus: bool = True,
+) -> dict:
+    """在验证集上评估 learned 臂；workers>1 时 GNN 走主进程 GPU。"""
+    if not entries:
+        raise ValueError("验证集条目为空")
+    n_workers = max(1, min(workers, len(entries)))
+    use_remote = n_workers > 1 or infer_service is not None
+    policy_state = None if use_remote else _policy_state_cpu(policy)
+    worker_device = "cpu" if use_remote else device
+    root = Path(dataset_dir)
+    tasks = []
+    for e in entries:
+        iid = e["instance_id"]
+        cached = load_binary_result(dataset_dir, iid, split=split)
+        if cached is None:
+            raise RuntimeError(f"缺少 ref 缓存 ({split}): {iid}")
+        tasks.append((
+            str(root / e["smt2"]),
+            iid,
+            cached,
+            policy_state,
+            worker_device,
+            refocus,
+            float(defer_logit),
+            bool(sticky_window),
+            use_remote,
+        ))
+    rows = _run_eval_tasks(
+        tasks,
+        worker_fn=_eval_val_worker,
+        n_workers=n_workers,
+        use_remote=use_remote,
+        policy=policy,
+        device=device,
+        desc=f"val/{split}",
+        infer_service=infer_service,
+        use_all_gpus=use_all_gpus,
+    )
+    return _aggregate_val_rows(rows)
 
 
 def _load_train_split(dataset_dir: str) -> tuple[list[OMTInstance], list[dict]]:
@@ -1022,6 +1155,8 @@ def main() -> None:
                     split="eval",
                     defer_logit=float(trainer.defer_logit.detach().cpu()),
                     sticky_window=sticky_window,
+                    # 与 RL collect 共用主进程 GPU 推理服务，避免再拷一份权重
+                    infer_service=trainer._infer_service,
                 )
                 print(
                     f"[val it={finished_iters}] mean_reward={metrics['mean_reward']:.4f} "

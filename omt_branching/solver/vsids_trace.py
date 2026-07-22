@@ -49,21 +49,41 @@ def _stat(s, key):
 class _VSIDSTraceProp(z3.UserPropagateBase):
     """观察-only propagator:跟踪赋值(add_fixed),在每次 decide 记录 VSIDS 的选择后放行。
 
-    结构与 :class:`LearnedDecidePropagator` 同(push/pop/fresh + get_id 表),唯一区别是
-    ``_on_decide`` 不 ``next_split`` —— 即不接管、只观察。
+    与 :class:`LearnedDecidePropagator` 同构：``atoms`` 全量 watch；``branch_atoms`` 才记
+    录 VSIDS 决策。``_on_decide`` 不 ``next_split`` —— 即不接管、只观察。
     """
 
-    def __init__(self, s, atoms, sink: list, config: VSIDSTraceConfig):
+    def __init__(
+        self,
+        s,
+        atoms,
+        sink: list,
+        config: VSIDSTraceConfig,
+        *,
+        branch_atoms=None,
+    ):
         super().__init__(s)
         self.atoms = list(atoms)
         self.key2atom = {atom_key(a): a for a in self.atoms}
         self._id2key = {a.get_id(): k for k, a in self.key2atom.items()}
-        self.sink = sink                 # 追加 (assignment_copy, chosen_key, phase_bool)
+        if branch_atoms is None:
+            branch_list = list(self.atoms)
+        else:
+            branch_list = list(branch_atoms)
+        self.branch_atoms = branch_list
+        self.branch_keys = {atom_key(a) for a in branch_list}
+        for a in branch_list:
+            k = atom_key(a)
+            if k not in self.key2atom:
+                self.atoms.append(a)
+                self.key2atom[k] = a
+                self._id2key[a.get_id()] = k
+        self.sink = sink  # (assignment_copy, trail_copy, chosen_key, phase_bool)
         self.config = config
         self._val: dict = {}
         self._trail: list = []
         self._lim: list = []
-        self.n_seen = 0                  # 落在注册原子上的 VSIDS 决策数
+        self.n_seen = 0  # 落在分支原子上的 VSIDS 决策数
         self.n_records = 0
         self.add_fixed(self._on_fixed)
         self.add_decide(self._on_decide)
@@ -80,7 +100,13 @@ class _VSIDSTraceProp(z3.UserPropagateBase):
                 self._val.pop(self._trail.pop(), None)
 
     def fresh(self, new_ctx):
-        return _VSIDSTraceProp(new_ctx, self.atoms, self.sink, self.config)
+        return _VSIDSTraceProp(
+            new_ctx,
+            self.atoms,
+            self.sink,
+            self.config,
+            branch_atoms=self.branch_atoms,
+        )
 
     def _on_fixed(self, t, v):
         k = self._id2key.get(t.get_id())
@@ -89,31 +115,43 @@ class _VSIDSTraceProp(z3.UserPropagateBase):
             self._trail.append(k)
 
     def _on_decide(self, t, idx, phase):
-        # t = VSIDS 将要分裂的文字。只观察落在已注册原子上的决策。
+        # t = VSIDS 将要分裂的文字。只观察落在分支候选上的决策。
         k = self._id2key.get(t.get_id())
-        if k is None or k in self._val:
-            return                        # 未注册(辅助变量)或已定 -> 跳过
+        if k is None or k not in self.branch_keys or k in self._val:
+            return  # 非分支 / 未 watch / 已定 -> 跳过
         self.n_seen += 1
         if self.config.stride > 1 and (self.n_seen % self.config.stride) != 0:
             return
         if self.config.max_examples and self.n_records >= self.config.max_examples:
             return
         ph = int(phase) == int(z3.Z3_L_TRUE)
-        self.sink.append((dict(self._val), k, ph))   # 复制赋值:z3 会 push/pop 改动 _val
+        asg = {kk: self._val[kk] for kk in self._trail}
+        self.sink.append((asg, list(self._trail), k, ph))
         self.n_records += 1
         # 不 next_split -> 放行 VSIDS 执行它自己的 t
 
 
-def collect_vsids_trajectory(assertions, atoms, config: VSIDSTraceConfig = VSIDSTraceConfig()):
+def collect_vsids_trajectory(
+    assertions,
+    atoms,
+    config: VSIDSTraceConfig = VSIDSTraceConfig(),
+    *,
+    branch_atoms=None,
+):
     """单实例观察 VSIDS 一遍。返回 ``(records, ref_conflicts, info)``:
 
-    - ``records``: ``list[(assignment_copy, chosen_key, phase_bool)]``,搜索中间状态标签;
+    - ``records``: ``list[(assignment, trail, chosen_key, phase_bool)]``;
     - ``ref_conflicts``: 本次(纯 VSIDS,观察-only 未覆盖)的 conflicts,作 RL 归一化参考;
     - ``info``: 结果摘要。
+
+    ``atoms`` 为 watch 全量；``branch_atoms`` 默认等于 ``atoms``（纯 SAT）；OMT 应传入
+    析取分支集。
     """
     s = z3.Solver()
     sink: list = []
-    prop = _VSIDSTraceProp(s, list(atoms), sink, config)
+    prop = _VSIDSTraceProp(
+        s, list(atoms), sink, config, branch_atoms=branch_atoms
+    )
     s.add(*assertions)
     res = s.check()
     ref_conflicts = _stat(s, "conflicts")
@@ -129,14 +167,19 @@ def collect_vsids_trajectory(assertions, atoms, config: VSIDSTraceConfig = VSIDS
 
 def records_to_examples(
     assertions,
-    records: list[tuple[dict[str, bool], str, bool]],
+    records: list,
     config: VSIDSTraceConfig = VSIDSTraceConfig(),
 ) -> list[RankingExample]:
     """把轨迹记录转为 RankingExample：每条记录一张图 + 近似 one-hot 标签。"""
     out: list[RankingExample] = []
     hard = list(assertions)
-    for assignment, chosen_key, phase in records:
-        snap, _ = build_bool_snapshot(hard, assignment=assignment)
+    for rec in records:
+        if len(rec) == 4:
+            assignment, trail, chosen_key, phase = rec
+        else:
+            assignment, chosen_key, phase = rec
+            trail = list(assignment.keys())
+        snap, _ = build_bool_snapshot(hard, assignment=assignment, trail=trail)
         graph = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
         bmap = graph.id_maps.get(NodeType.BOOL_VAR, {})
         if chosen_key not in bmap:
@@ -166,7 +209,7 @@ def build_vsids_examples_sat(problems, config: VSIDSTraceConfig = VSIDSTraceConf
 
 
 def _omt_assertions_and_atoms(inst):
-    """与部署 decider 一致：预处理后断言 + 析取子句注册原子。"""
+    """与部署 decider 一致：预处理后断言 + watch 全量 + 析取分支集。"""
     from omt_branching.solver.propagator_snapshot import prepare_propagator_formula
 
     return prepare_propagator_formula(list(inst.hard))
@@ -190,7 +233,7 @@ def _compute_and_maybe_cache_vsids(
         save_vsids_trace_result,
     )
 
-    assertions, atoms = _omt_assertions_and_atoms(inst)
+    assertions, watch, branch = _omt_assertions_and_atoms(inst)
     cached = None
     if use_cache and dataset_dir and split and inst.instance_id:
         cached = load_vsids_trace_result(
@@ -206,9 +249,9 @@ def _compute_and_maybe_cache_vsids(
         return []
 
     records, ref_conflicts, info = collect_vsids_trajectory(
-        assertions, atoms, config
+        assertions, watch, config, branch_atoms=branch
     )
-    # 空轨迹也落盘：标记「已采集、无注册原子决策」，避免每次被当成缺失重算
+    # 空轨迹也落盘：标记「已采集、无分支原子决策」，避免每次被当成缺失重算
     if use_cache and dataset_dir and split and inst.instance_id:
         save_vsids_trace_result(
             dataset_dir,

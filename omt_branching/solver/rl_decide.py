@@ -7,6 +7,11 @@
 ``sticky_window=False``（``DecideRLConfig`` / ``decide_branch`` 训练默认）：每次
 decide 都采样并记 step。
 
+``sample=True`` 时 defer logit 额外加 ``log n``（n=当前参与采样的未定原子数）：
+若 ``ℓ_defer = s_i``（各原子同分），则 ``P(defer)=1/2``、每个原子 ``1/(2n)``，
+即 defer 与「从 n 个原子中任选其一」总概率对半，避免 n 增大时原子集合稀释 defer。
+``sample=False``（argmax）不加该项。
+
 冲突回退（propagator ``pop`` → :meth:`SamplingPolicyDecider.on_backtrack`，默认开启）
 会清空粘性窗并强制下次 decide 立刻 refocus。
 
@@ -19,6 +24,7 @@ decide 都采样并记 step。
 
 from __future__ import annotations
 
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -40,6 +46,7 @@ from omt_branching.solver.decide_omt import solve_omt_with_decider
 from omt_branching.solver.interfaces import Sense
 from omt_branching.solver.propagator_snapshot import (
     build_bool_snapshot,
+    merge_assignment_trail,
     merge_root_assignment,
     root_forced_assignment,
 )
@@ -48,6 +55,20 @@ from tqdm import tqdm
 
 DEFAULT_RL_COLLECT_WORKERS = 4
 MIN_INSTANCES_FOR_RL_PARALLEL = 8
+
+
+def _branch_action_logits(
+    defer_logit: torch.Tensor,
+    atom_scores: torch.Tensor,
+    *,
+    sample: bool,
+) -> torch.Tensor:
+    """构造 ``[defer, atom...]`` logits；``sample`` 时 defer 加 ``log n``。"""
+    n = int(atom_scores.numel())
+    defer = defer_logit.reshape(1)
+    if sample and n > 0:
+        defer = defer + math.log(n)
+    return torch.cat([defer, atom_scores])
 
 # ProcessPool worker 全局（initializer 注入主进程 GpuInferService 的请求队列）
 _INFER_REQ = None
@@ -201,6 +222,11 @@ class GpuInferService:
         self._req = req_queue
         self._thread: threading.Thread | None = None
         self._workers: ThreadPoolExecutor | None = None
+
+    @property
+    def req_queue(self):
+        """供 eval/test 等与 collect 共用同一推理队列。"""
+        return self._req
 
     @classmethod
     def from_policy(
@@ -533,8 +559,11 @@ class SamplingPolicyDecider:
         if not keys or self._graph is None:
             self._window_defer = True
             return None
-        defer = self.defer_logit.detach().cpu().reshape(1)
-        logits = torch.cat([defer, self._scores[locs]])
+        logits = _branch_action_logits(
+            self.defer_logit.detach().cpu(),
+            self._scores[locs],
+            sample=self.sample,
+        )
         if self.sample:
             idx = int(torch.multinomial(torch.softmax(logits, dim=0), 1).item())
         else:
@@ -549,9 +578,12 @@ class SamplingPolicyDecider:
         self._window_phase = phase
         return key, phase
 
-    def _refocus(self, assignment) -> None:
+    def _refocus(self, assignment, trail=None) -> None:
         asg = merge_root_assignment(self._root_fixed, assignment)
-        snap, _ = build_bool_snapshot(self.assertions, assignment=asg)
+        ordered = merge_assignment_trail(self._root_fixed, assignment, trail)
+        snap, _ = build_bool_snapshot(
+            self.assertions, assignment=asg, trail=ordered
+        )
         # 建图始终在 CPU；steps 存 CPU 图，update 时再搬到训练设备
         g = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
         if self.infer_pool is not None:
@@ -565,9 +597,9 @@ class SamplingPolicyDecider:
         self._bmap = g.id_maps.get(NodeType.BOOL_VAR, {})
         self._rebuild_key_tables()
 
-    def __call__(self, undecided_keys, assignment) -> Optional[tuple]:
+    def __call__(self, undecided_keys, assignment, trail=None) -> Optional[tuple]:
         if self._since >= self.refocus_every:
-            self._refocus(assignment)
+            self._refocus(assignment, trail)
             self._since = 0
             if self.sticky_window:
                 # 本窗唯一一次采样 / 记 step；返回值即本次回调结果
@@ -594,8 +626,11 @@ class SamplingPolicyDecider:
         keys, locs = self._undecided_pairs(undecided_keys)
         if not keys:
             return None
-        defer = self.defer_logit.detach().cpu().reshape(1)
-        logits = torch.cat([defer, self._scores[locs]])
+        logits = _branch_action_logits(
+            self.defer_logit.detach().cpu(),
+            self._scores[locs],
+            sample=self.sample,
+        )
         probs = torch.softmax(logits, dim=0)
         idx = (
             int(torch.multinomial(probs, 1).item())
@@ -893,7 +928,10 @@ class DecideRLTrainer:
                     g_dev = g.to(target)
                 cache[gid] = self.policy(g_dev).bool_branch_scores
             scores = cache[gid]
-            logits = torch.cat([self.defer_logit.reshape(1), scores[locs]])
+            # 与 sample=True 采集时同一分布（含 defer 的 log n）
+            logits = _branch_action_logits(
+                self.defer_logit, scores[locs], sample=True
+            )
             logp = torch.log_softmax(logits, dim=0)[idx]
             loss = loss - logp * adv
             n += 1

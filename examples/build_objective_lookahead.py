@@ -5,20 +5,20 @@
    得到会注册到 UserPropagator 的析取子句原子；
 2. 用 z3 二进制求原问题（预处理后硬约束）的目标最优值；
 3. 对每个注册原子分别加真/假硬约束，再用 z3 二进制求局部最优；
-4. 打分（设注册原子数为 n）：
-   - 真/假均不改变全局最优 → 得分 ``-n``（相位任意）；
+4. 打分：
+   - 真/假均不改变全局最优 → 得分 ``-1``（相位任意）；
    - 一侧全局最优、另一侧 unsat → 得分 ``0``（相位取全局最优侧）；
    - 其余：一侧全局最优、另一侧为更差的局部最优，按
-     ``|局部最优 - 全局最优|`` 从大到小排序，得分从 ``n`` 递减、步长 1
-     （相位取全局最优侧）；
+     ``|局部最优 - 全局最优|`` 从大到小排序，得分从 ``1`` 起按名次递增
+     （最差 impactful 为 1，最优为 ``m``，步长 1；相位取全局最优侧）；
 5. **defer 分**：``max(0, max_score - 2)``，与原子分一并写入样本（供 ListNet 含 defer）。
 
-非根采样：与 defer 同一门槛——仅固定根上得分 **> defer_score** 的原子（连续排名下即
-评分前 2）；``check`` 取 model → Better-cut → 再对剩余原子**剪枝重评**（图断言含 cut）：
+非根采样：与 defer 同一门槛——固定根上**所有**得分 ``>= defer_score`` 的原子；
+``check`` 取 model → Better-cut → 再对剩余原子**剪枝重评**（图断言含 cut）：
 
 - 正分原子：根上最优侧在 cut 后不变，只重解非最优侧；
 - 得分 0：两侧不变，保持 0；
-- 得分 ``-n``：可能一侧变为局部最优/unsat；若已发现一侧非（局部）全局最优，
+- 得分 ``-1``：可能一侧变为局部最优/unsat；若已发现一侧非（局部）全局最优，
   则另一侧必为最优，无需再搜。
 
 缓存布局（与 split look-ahead 分离）::
@@ -104,7 +104,7 @@ def save_objective_lookahead_result(
         "instance_id": instance_id,
         "split": split,
         "kind": "objective",
-        "version": 3,
+        "version": 6,
         "n_atoms": int(n_atoms),
         "opt_value": str(opt_value) if opt_value is not None else None,
         "scores": {str(k): float(v) for k, v in scores.items()},
@@ -123,6 +123,11 @@ def save_objective_lookahead_result(
                 str(k): bool(v) for k, v in (nonroot.get("phases") or {}).items()
             },
             "n_atoms": int(nonroot.get("n_atoms") or 0),
+            "n_fixed": int(
+                nonroot.get("n_fixed")
+                if nonroot.get("n_fixed") is not None
+                else len(nonroot.get("assignment") or {})
+            ),
             "opt_value": (
                 str(nonroot["opt_value"])
                 if nonroot.get("opt_value") is not None
@@ -184,6 +189,11 @@ def load_objective_lookahead_result(
                 str(k): bool(v) for k, v in (nonroot_raw.get("phases") or {}).items()
             },
             "n_atoms": int(nonroot_raw.get("n_atoms") or 0),
+            "n_fixed": int(
+                nonroot_raw.get("n_fixed")
+                if nonroot_raw.get("n_fixed") is not None
+                else len(nonroot_raw.get("assignment") or {})
+            ),
             "opt_value": nonroot_raw.get("opt_value"),
             "defer_score": float(nr_defer),
             "model_value": nonroot_raw.get("model_value"),
@@ -282,21 +292,27 @@ def _finalize_atom_scores(
     failed_lit: list[tuple[str, bool]],
     impactful: list[tuple[str, Fraction, bool]],
 ) -> tuple[dict[str, float], dict[str, bool]]:
-    """由分类桶生成得分/相位（n 为参与评分的原子数）。"""
+    """由分类桶生成得分/相位。
+
+    - 无影响：``-1``；
+    - 一侧 unsat：``0``；
+    - impactful：按 gap 降序，得分 ``m, m-1, ..., 1``（``m=|impactful|``，最优最大）。
+    ``n`` 保留以兼容调用方，不再参与赋分。
+    """
+    del n  # 旧版用 -n / 从 n 递减；现与总原子数解耦
     scores: dict[str, float] = {}
     phases: dict[str, bool] = {}
     for k in unaffected:
-        scores[k] = float(-n)
+        scores[k] = -1.0
         phases[k] = True
     for k, ph in failed_lit:
         scores[k] = 0.0
         phases[k] = ph
     impactful.sort(key=lambda row: (-row[1], row[0]))
-    rank = n
-    for k, _gap, ph in impactful:
-        scores[k] = float(rank)
+    m = len(impactful)
+    for i, (k, _gap, ph) in enumerate(impactful):
+        scores[k] = float(m - i)  # 最优 → m … 最差 → 1
         phases[k] = ph
-        rank -= 1
     return scores, phases
 
 
@@ -395,8 +411,8 @@ def _score_rem_atoms_after_cut(
 ) -> tuple[dict[str, float], dict[str, bool]]:
     """非根剪枝重评：利用根评分跳过不变的原子侧。
 
-    前提：Better-cut 后仍 sat 且 ``opt_cut`` 可达（调用方已保证）；固定的前 2
-    原子取根最优相位后，根上「仅一侧最优」的原子其最优侧不变。
+    前提：Better-cut 后仍 sat 且 ``opt_cut`` 可达（调用方已保证）；已固定所有根上
+    得分 ``>= defer`` 的原子（取其根最优相位）后，根上「仅一侧最优」的原子其最优侧不变。
     """
     n = len(rem_keys)
     if n == 0:
@@ -436,7 +452,7 @@ def _score_rem_atoms_after_cut(
                 impactful.append((k, abs(val_o - opt_cut), opt_ph))
             continue
 
-        # 得分 -n：一侧非最优 ⇒ 另一侧必为最优，可剪掉第二次搜索
+        # 得分 -1：一侧非最优 ⇒ 另一侧必为最优，可剪掉第二次搜索
         val_t, st_t = _solve_opt(
             _forced_instance(inst, hard_cut, a),
             z3_path=z3_path,
@@ -486,7 +502,7 @@ def objective_lookahead_scores(
     返回 ``(scores, phases, global_opt, n_atoms, nonroot_or_none)``。
     ``nonroot`` 形如 ``{assignment, scores, phases, n_atoms, opt_value}``。
     """
-    hard_use, atoms = prepare_propagator_formula(list(inst.hard))
+    hard_use, _watch, atoms = prepare_propagator_formula(list(inst.hard))
     n = len(atoms)
     if n == 0:
         return {}, {}, None, 0, None
@@ -525,13 +541,15 @@ def _keys_above_defer(
     *,
     key_to_atom: dict | None = None,
 ) -> tuple[list[str], float]:
-    """与 defer 统一：得分严格大于 ``defer_score`` 的原子（通常为评分前 2）。"""
+    """与 defer 统一：返回得分 ``>= defer_score = max(0, max_score - 2)`` 的**全部**原子。
+
+    不截断数量。按分数降序、键名升序稳定排序。
+    """
     defer = _defer_score_from_scores(scores)
     keys = [
         k for k, sc in scores.items()
-        if sc > defer and (key_to_atom is None or k in key_to_atom)
+        if sc >= defer and (key_to_atom is None or k in key_to_atom)
     ]
-    # 同分时按键名稳定排序，再按分数降序（前 2 语义清晰）
     keys.sort(key=lambda k: (-scores[k], k))
     return keys, defer
 
@@ -547,7 +565,7 @@ def _sample_nonroot_scores(
     z3_path: str | None,
     timeout_s: int,
 ) -> dict | None:
-    """固定根上得分 > defer 的原子（前 2）后：check→model→Better-cut，剪枝重评剩余。"""
+    """固定根上所有得分 >= defer 的原子后：check→model→Better-cut，剪枝重评剩余。"""
     fix_keys, root_defer = _keys_above_defer(root_scores, key_to_atom=key_to_atom)
     rem_keys = [k for k in key_to_atom if k not in fix_keys]
     if not fix_keys or not rem_keys:
@@ -594,6 +612,7 @@ def _sample_nonroot_scores(
         "scores": scores_nr,
         "phases": phases_nr,
         "n_atoms": len(rem_keys),
+        "n_fixed": len(fix_keys),
         "opt_value": opt_cut,
         "defer_score": _defer_score_from_scores(scores_nr),
         "root_defer_score": root_defer,
@@ -684,7 +703,7 @@ def build_objective_lookahead_examples(
     cached: dict | None = None,
 ) -> list[RankingExample]:
     """单实例 → 根（+可选非根）RankingExample 列表。"""
-    hard_use, _atoms = prepare_propagator_formula(list(inst.hard))
+    hard_use, _watch, _branch = prepare_propagator_formula(list(inst.hard))
     if cached is not None:
         scores = cached["scores"]
         phases = cached["phases"]

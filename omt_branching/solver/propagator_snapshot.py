@@ -2,16 +2,18 @@
 
 抽取原子（比较原子 + 布尔常量）与**子句共现图**，配合 propagator 动态赋值/统计喂给 GNN。
 
-注册策略（与建图分离）：
-- :func:`collect_atoms` —— 全部原子（建图 / look-ahead）；
-- :func:`collect_clause_atoms` —— 仅 CNF 析取子句（|lits|≥2）中的原子（``prop.add``）；
-- :func:`preprocess_assertions` / :func:`prepare_propagator_formula` —— 挂 prop 前轻量预处理。
+注册策略（与建图配合）：
+- :func:`collect_atoms` —— 全部原子（建图 / watch ``prop.add`` 收 ``fixed``）；
+- :func:`collect_clause_atoms` —— 仅 CNF 析取子句（|lits|≥2）中的原子（分支 undecided）；
+- :func:`preprocess_assertions` / :func:`prepare_propagator_formula` —— 挂 prop 前轻量预处理，
+  返回 ``(pp, watch_atoms, branch_atoms)``。
 
-建图动态投影（``assignment`` / ``fixed``）：
+建图动态投影（``assignment`` / ``trail`` / ``fixed``）：
 - :func:`build_bool_snapshot` 在非空赋值下做布尔单元传播闭包，再投影子句边、
-  剪掉已定候选，供 GNN 在当前部分赋值下重建图（不调用 z3 理论引擎）。
+  剪掉已定候选；``trail`` 保序写入 ``decision_level``（赋值先后时间戳）。
 - :func:`root_forced_assignment` —— OMT better-cut 后在根状态用 ``consequences``
-  求硬断言强制的原子赋值；经 :func:`merge_root_assignment` 并入搜索 trail，
+  求硬断言强制的原子赋值；经 :func:`merge_root_assignment` /
+  :func:`merge_assignment_trail` 并入搜索 trail，
   供跨 cut 简化建图（剪掉根级已定候选 / 投影子句）。在**独立** ``z3.Context``
   上求解，不污染主 Solver 的 ``rlimit``；自身消耗作为返回值第二项，由 decider
   累计为 ``consequence rlimit``（与主搜索 ``rlimit`` 并列，RL 奖励默认不计入）。
@@ -157,10 +159,11 @@ def _clause_atom_exprs(clause) -> list:
 
 
 def collect_clause_atoms(assertions) -> list:
-    """仅收集 **CNF 析取子句**（字面量数 ≥ 2）中的原子，供 ``prop.add`` 注册。
+    """仅收集 **CNF 析取子句**（字面量数 ≥ 2）中的原子，供分支 undecided。
 
-    单元约束（盒界 ``x≥0``、单文字子句等）不注册——它们通常由理论传播决定，
+    单元约束（盒界 ``x≥0``、单文字子句等）不作分支候选——它们通常由理论传播决定，
     不构成布尔分支决策点。嵌套 ``And`` 会先拆成子句再判断。
+    全量 ``prop.add``（收 ``fixed``）请用 :func:`collect_atoms`。
     """
     dedup: dict = {}
     uniq: list = []
@@ -213,13 +216,18 @@ def preprocess_assertions(assertions) -> list:
     return out if out else assertions
 
 
-def prepare_propagator_formula(assertions) -> tuple[list, list]:
-    """预处理断言并抽取应注册的析取子句原子。
+def prepare_propagator_formula(assertions) -> tuple[list, list, list]:
+    """预处理断言并抽取 propagator 用的两类原子（同 Context）。
 
-    返回 ``(预处理后断言, register_atoms)``；二者同 Context，供 Solver.add / prop.add。
+    返回 ``(预处理后断言, watch_atoms, branch_atoms)``：
+
+    - ``watch_atoms``：:func:`collect_atoms` 全量图内布尔原子，供 ``prop.add`` 收齐
+      ``fixed`` 赋值；
+    - ``branch_atoms``：:func:`collect_clause_atoms` 析取子句原子，才可作 undecided
+      分支候选。
     """
     pp = preprocess_assertions(assertions)
-    return pp, collect_clause_atoms(pp)
+    return pp, collect_atoms(pp), collect_clause_atoms(pp)
 
 
 def _consequence_literal_assignment(imps) -> dict[str, bool]:
@@ -288,10 +296,44 @@ def merge_root_assignment(
     root_fixed: Optional[dict] = None,
     assignment: Optional[dict] = None,
 ) -> dict:
-    """合并根级强制赋值与搜索 trail；trail 覆盖同键（与 z3 当前赋值一致）。"""
+    """合并根级强制赋值与搜索 trail；trail 覆盖同键（与 z3 当前赋值一致）。
+
+    返回 dict 保持插入序：先 ``root_fixed`` 键序，再 ``assignment`` 键序（后者覆盖）。
+    """
     out: dict = dict(root_fixed or {})
     if assignment:
         out.update(assignment)
+    return out
+
+
+def merge_assignment_trail(
+    root_fixed: Optional[dict] = None,
+    assignment: Optional[dict] = None,
+    trail: Optional[list] = None,
+) -> list:
+    """构造赋值先后序列，供 :func:`build_bool_snapshot` 填 ``decision_level``。
+
+    顺序：仍在合并赋值中的根强制键（``root_fixed`` 插入序）在前，
+    其后接搜索 ``trail``（trail 中的键覆盖根侧同键的时间戳位置）。
+    """
+    asg = merge_root_assignment(root_fixed, assignment)
+    if not asg:
+        return []
+    trail_list = list(trail) if trail else []
+    trail_set = set(trail_list)
+    out: list = []
+    if root_fixed:
+        for k in root_fixed:
+            if k in asg and k not in trail_set:
+                out.append(k)
+    for k in trail_list:
+        if k in asg:
+            out.append(k)
+    seen = set(out)
+    for k in asg:
+        if k not in seen:
+            out.append(k)
+            seen.add(k)
     return out
 
 
@@ -591,23 +633,42 @@ def _occ_from_clauses(clauses: list[ClauseInfo], atom_keys: list[str]):
     return occ, pos, neg
 
 
-def build_bool_snapshot(assertions, assignment: Optional[dict] = None,
-                        stats: Optional[dict] = None, snapshot_id: str = "prop"):
+def build_bool_snapshot(
+    assertions,
+    assignment: Optional[dict] = None,
+    stats: Optional[dict] = None,
+    snapshot_id: str = "prop",
+    *,
+    trail: Optional[list] = None,
+):
     """构造 SolverSnapshot。
 
     静态部分（原子/子句/理论特征）按 ``assertions`` 缓存。
     ``assignment`` 非空时：布尔 BCP 闭包 → 投影子句边 → 剪掉已定候选，重建动态图视图；
     空赋值时直接复用静态子句对象（零拷贝）。
+
+    ``trail`` 为赋值先后键序列（保序）。写入每个已定布尔节点的 ``decision_level``：
+    trail 中第 ``i`` 个键（0-based）→ ``decision_level = i + 1``；仅由 BCP 推出、
+    未出现在 trail 中的键 → ``0``；未赋值 → ``None``。
     """
     assignment = assignment or {}
     stats = stats or {}
     static = _get_static(list(assertions))
+
+    # trail 序 → decision_level（1-based 时间戳）；重复键保留首次出现
+    level_of: dict[str, int] = {}
+    if trail:
+        for i, k in enumerate(trail):
+            sk = str(k)
+            if sk not in level_of:
+                level_of[sk] = i + 1
 
     if not assignment:
         bool_vars = [
             BooleanVarInfo(
                 var_id=k,
                 assignment=None,
+                decision_level=None,
                 is_candidate=True,
                 occurrence_count=static.occ[k],
                 pos_count=static.pos[k],
@@ -627,9 +688,14 @@ def build_bool_snapshot(assertions, assignment: Optional[dict] = None,
         for k in static.atom_keys:
             val = asg.get(k)
             fixed = val is not None
+            if fixed:
+                dl = level_of.get(str(k), 0)
+            else:
+                dl = None
             bool_vars.append(BooleanVarInfo(
                 var_id=k,
                 assignment=val,
+                decision_level=dl,
                 is_candidate=not fixed,
                 is_eliminated=False,
                 occurrence_count=occ[k],
@@ -666,6 +732,7 @@ __all__ = [
     "prepare_propagator_formula",
     "root_forced_assignment",
     "merge_root_assignment",
+    "merge_assignment_trail",
     "build_bool_snapshot",
     "clear_bool_snapshot_cache",
 ]

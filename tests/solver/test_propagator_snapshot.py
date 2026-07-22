@@ -57,14 +57,19 @@ def test_preprocess_then_clause_atoms_via_prepare():
     a, b = x >= 5, x <= 2
     # 冗余真值单元：simplify/propagate 后应被消掉或弱化
     asserts = [x >= 0, x <= 10, z3.Or(a, b), z3.BoolVal(True)]
-    pp, atoms = prepare_propagator_formula(asserts)
+    pp, watch, branch = prepare_propagator_formula(asserts)
     assert pp, "预处理后应仍有断言"
     assert all(hasattr(f, "ctx") and f.ctx == asserts[0].ctx for f in pp)
-    reg = {atom_key(t) for t in atoms}
-    # 析取分支原子应仍在注册集（或预处理改写后仍为 ≥2 元子句的原子）
+    reg = {atom_key(t) for t in branch}
+    # 分支原子应是 watch 全量的子集
+    assert reg <= {atom_key(t) for t in watch}
     assert reg <= {atom_key(t) for t in collect_atoms(pp)}
-    # 单元盒界即使仍在 pp 中也不应单独构成注册（除非被并进多元 Or）
+    # 单元盒界即使仍在 pp 中也不应单独构成分支集（除非被并进多元 Or）
     assert atom_key(x >= 0) not in reg or len(collect_clause_atoms([x >= 0])) == 0
+    # watch 应包含盒界（图上全量）
+    assert atom_key(x >= 0) in {atom_key(t) for t in watch} or atom_key(x >= 0) not in {
+        atom_key(t) for t in collect_atoms(pp)
+    }
 
 
 def test_preprocess_assertions_idempotent_sat():
@@ -90,6 +95,23 @@ def test_assignment_and_candidates():
     assert len(snap.clauses) == 1
     assert snap.clauses[0].is_satisfied is True
     assert snap.clauses[0].literals == []
+
+
+def test_trail_fills_decision_level():
+    """trail 序写入 decision_level（1-based）；仅 BCP 推出的为 0。"""
+    clear_bool_snapshot_cache()
+    x = z3.Int("x")
+    a, b = x >= 5, x <= 2
+    ka, kb = atom_key(a), atom_key(b)
+    snap, _ = build_bool_snapshot(
+        [z3.Or(a, b)],
+        assignment={ka: False},
+        trail=[ka],
+    )
+    by_id = {bv.var_id: bv for bv in snap.bool_vars}
+    assert by_id[ka].decision_level == 1
+    assert by_id[kb].assignment is True
+    assert by_id[kb].decision_level == 0  # BCP，不在 trail
 
 
 def test_boolean_bcp_forces_unit_and_prunes_edges():

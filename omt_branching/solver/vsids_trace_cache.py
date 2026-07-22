@@ -5,7 +5,7 @@
 
     vsids_trace/<split>/<instance_id>.json
 
-缓存存中间状态记录（assignment / chosen_key / phase）；建 ``RankingExample`` 时仍需从
+缓存存中间状态记录（assignment / trail / chosen_key / phase）；建 ``RankingExample`` 时仍需从
 ``.smt2`` 按各 assignment 建图，再映射到图内局部索引（建图远比重跑 VSIDS 轨迹便宜）。
 ``weight`` 仅在建样本时使用，不参与缓存指纹。
 """
@@ -42,7 +42,7 @@ def save_vsids_trace_result(
     instance_id: str,
     *,
     split: str,
-    records: list[tuple[dict[str, bool], str, bool]],
+    records: list,
     ref_conflicts: int = 0,
     info: dict | None = None,
     stride: int = 1,
@@ -51,20 +51,26 @@ def save_vsids_trace_result(
     """立刻写入 VSIDS 轨迹记录。"""
     path = vsids_trace_result_path(dataset_dir, instance_id, split=split)
     path.parent.mkdir(parents=True, exist_ok=True)
+    ser_records = []
+    for rec in records:
+        if len(rec) == 4:
+            assignment, trail, chosen_key, phase = rec
+        else:
+            assignment, chosen_key, phase = rec
+            trail = list(assignment.keys())
+        ser_records.append({
+            "assignment": {str(k): bool(v) for k, v in assignment.items()},
+            "trail": [str(k) for k in trail],
+            "chosen_key": str(chosen_key),
+            "phase": bool(phase),
+        })
     payload = {
         "instance_id": instance_id,
         "split": split,
         "config": _config_fingerprint(stride, max_examples),
         "ref_conflicts": int(ref_conflicts),
         "info": info or {},
-        "records": [
-            {
-                "assignment": {str(k): bool(v) for k, v in assignment.items()},
-                "chosen_key": str(chosen_key),
-                "phase": bool(phase),
-            }
-            for assignment, chosen_key, phase in records
-        ],
+        "records": ser_records,
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -96,11 +102,13 @@ def load_vsids_trace_result(
         return None
     records = []
     for r in payload.get("records") or []:
-        records.append((
-            {str(k): bool(v) for k, v in (r.get("assignment") or {}).items()},
-            str(r["chosen_key"]),
-            bool(r["phase"]),
-        ))
+        asg = {str(k): bool(v) for k, v in (r.get("assignment") or {}).items()}
+        trail = r.get("trail")
+        if trail is None:
+            trail = list(asg.keys())
+        else:
+            trail = [str(k) for k in trail]
+        records.append((asg, trail, str(r["chosen_key"]), bool(r["phase"])))
     return {
         "records": records,
         "ref_conflicts": int(payload.get("ref_conflicts") or 0),

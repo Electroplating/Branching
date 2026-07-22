@@ -42,7 +42,7 @@ def _num(ref):
     return Fraction(str(ref))
 
 
-def _defer_always(_undecided, _assignment):
+def _defer_always(_undecided, _assignment, _trail=None):
     """公平 VSIDS：decide 回调恒返回 None，不调用 next_split，退回 z3 原生 VSIDS。"""
     return None
 
@@ -65,15 +65,17 @@ def solve_omt_with_decider(
     始终对硬约束做轻量预处理（``prepare_propagator_formula``），并在简化后的断言上
     ``check``。
 
-    - ``attach_propagator=True``（默认）：挂 propagator，只注册析取子句（字面量数 ≥ 2）
-      中的原子。默认类为 ``LearnedDecidePropagator``；可用 ``propagator_factory(s, atoms,
-      decider)`` 替换（例如带 decide 轨迹日志的子类）。``decider_factory=None`` 时
-      decider 恒 defer（公平 VSIDS 臂）；否则 ``decider_factory(assertions) -> decider``。
+    - ``attach_propagator=True``（默认）：挂 propagator；**全量**图内布尔原子
+      ``prop.add`` 以收齐 ``fixed`` 赋值，但仅析取子句（字面量数 ≥ 2）中的原子进入
+      undecided 分支候选。默认类为 ``LearnedDecidePropagator``；可用
+      ``propagator_factory(s, watch_atoms, decider, branch_atoms=...)`` 替换。
+      ``decider_factory=None`` 时 decider 恒 defer（公平 VSIDS 臂）；否则
+      ``decider_factory(assertions) -> decider``（``decider(undecided, assignment, trail)``）。
     - ``attach_propagator=False``：不挂 propagator（check-sat-loop 臂）；忽略
       ``decider_factory`` / ``propagator_factory``。
     - 每次 better-cut 写入 Solver 后，若 decider 实现 ``add_hard``，会把 cut 并入 GNN
       建图断言，并在**独立 Context** 上刷新根级 ``consequences`` 强制赋值（跨 cut
-      简化建图）；不额外 ``prop.add``：单元 cut 本就不注册。consequences 的 rlimit
+      简化建图）；不额外 ``prop.add``：单元 cut 本就不作分支候选。consequences 的 rlimit
       记入返回值 ``consequence rlimit``，**不计入**主搜索 ``rlimit`` /
       ``weighted rlimit``（RL 奖励默认用后者；完整代价见 ``rlimit with consequence``）。
 
@@ -91,17 +93,21 @@ def solve_omt_with_decider(
     solver_rlimit = _stat(s, "rlimit count")
     rlimit = solver_rlimit
     prop = None
-    # 两臂均预处理；公平 VSIDS / learned 再挂 prop（仅注册析取子句原子）。
-    hard_use, atoms = prepare_propagator_formula(hard_iso)
+    # 两臂均预处理；公平 VSIDS / learned 再挂 prop（watch=全量，branch=析取集）。
+    hard_use, watch_atoms, branch_atoms = prepare_propagator_formula(hard_iso)
     if attach_propagator:
         if decider_factory is None:
             decider = _defer_always
         else:
             decider = decider_factory(hard_use)
         if propagator_factory is not None:
-            prop = propagator_factory(s, atoms, decider)
+            prop = propagator_factory(
+                s, watch_atoms, decider, branch_atoms=branch_atoms
+            )
         else:
-            prop = LearnedDecidePropagator(s, atoms, decider)
+            prop = LearnedDecidePropagator(
+                s, watch_atoms, decider, branch_atoms=branch_atoms
+            )
     decider_factory_rlimit = _stat(s, "rlimit count") - rlimit
     rlimit += decider_factory_rlimit
 

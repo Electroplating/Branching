@@ -20,7 +20,7 @@ def _stat(s, key):
 def solve_sat_with_decider(assertions, atoms, decider_factory=None) -> dict:
     s = z3.Solver()
     if decider_factory is None:
-        decider = lambda und, asg: None            # defer-always = VSIDS 臂
+        decider = lambda und, asg, trail=None: None  # defer-always = VSIDS 臂
     else:
         decider = decider_factory(list(assertions))
     prop = LearnedDecidePropagator(s, atoms, decider)   # 恒附 -> 关预处理

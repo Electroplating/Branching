@@ -19,7 +19,7 @@ def test_override_arm_controls_and_correct():
     atoms, clauses = generate_php(6)
     r = solve_sat_with_decider(
         clauses, atoms,
-        decider_factory=lambda a: (lambda und, asg: (min(und), True)))
+        decider_factory=lambda a: (lambda und, asg, trail=None: (min(und), True)))
     assert r["result"] == "unsat"
     assert r["decisions"] > 0                               # 我们强制了决策
 

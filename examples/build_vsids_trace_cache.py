@@ -62,10 +62,10 @@ def _worker(task: tuple) -> dict:
         }
 
     inst = smt2_to_instance(smt2_path, instance_id=instance_id)
-    assertions, atoms = prepare_propagator_formula(list(inst.hard))
+    assertions, watch, branch = prepare_propagator_formula(list(inst.hard))
     cfg = VSIDSTraceConfig(stride=stride, max_examples=max_examples)
     records, ref_conflicts, info = collect_vsids_trajectory(
-        assertions, atoms, cfg
+        assertions, watch, cfg, branch_atoms=branch
     )
     # 空轨迹也落盘，供 imitation 识别「已采集」而非缺失
     save_vsids_trace_result(
