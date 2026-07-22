@@ -83,6 +83,8 @@ def _imitation_fingerprint(args: argparse.Namespace) -> dict:
         "vsids_max_ex": int(args.vsids_max_ex),
         "vsids_stride": int(args.vsids_stride),
         "imitation_nonroot": bool(args.imitation_nonroot),
+        "imitation_patience": int(args.imitation_patience),
+        "imitation_tol": float(args.imitation_tol),
     }
 
 
@@ -93,16 +95,16 @@ def _try_load_imitation_ckpt(
     *,
     device: str,
     force: bool,
-) -> bool:
-    """若存在匹配的 imitation checkpoint 则加载并返回 True（可跳过训练）。"""
+) -> dict | None:
+    """若存在匹配的 imitation checkpoint 则加载并返回 meta；否则 ``None``。"""
     path = _imitation_ckpt_path(ckpt_dir)
     if force or not os.path.isfile(path):
-        return False
+        return None
     try:
         meta = load_policy_into(policy, path, map_location=device)
     except Exception as exc:
         print(f"imitation checkpoint 加载失败（将重训）: {path} ({exc})")
-        return False
+        return None
     mismatches = [
         k for k, v in fingerprint.items()
         if k != "stage" and meta.get(k) != v
@@ -111,13 +113,14 @@ def _try_load_imitation_ckpt(
         detail = ", ".join(f"{k}: ckpt={meta.get(k)!r} now={fingerprint[k]!r}"
                            for k in mismatches)
         print(f"imitation checkpoint 超参不匹配（将重训）: {detail}")
-        return False
+        return None
     print(
         f"加载 imitation checkpoint -> {path} "
         f"(teacher={meta.get('teacher')}, epochs={meta.get('epochs')}, "
-        f"n_examples={meta.get('n_examples')})"
+        f"n_examples={meta.get('n_examples')}, "
+        f"defer_logit={meta.get('defer_logit', 0.0)})"
     )
-    return True
+    return meta
 
 
 def _save_imitation_ckpt(
@@ -127,14 +130,22 @@ def _save_imitation_ckpt(
     *,
     n_examples: int,
     hist: list[dict],
+    defer_logit: float = 0.0,
 ) -> str:
     os.makedirs(ckpt_dir, exist_ok=True)
     path = _imitation_ckpt_path(ckpt_dir)
+    metric_rows = [h for h in hist if "branch" in h or "loss" in h]
     meta = {
         **fingerprint,
         "n_examples": int(n_examples),
-        "branch_loss_first": float((hist[0] if hist else {}).get("branch", 0.0)),
-        "branch_loss_last": float((hist[-1] if hist else {}).get("branch", 0.0)),
+        "defer_logit": float(defer_logit),
+        "branch_loss_first": float(
+            (metric_rows[0] if metric_rows else {}).get("branch", 0.0)
+        ),
+        "branch_loss_last": float(
+            (metric_rows[-1] if metric_rows else {}).get("branch", 0.0)
+        ),
+        "finished_epochs": len(metric_rows),
     }
     save_policy(policy, path, meta=meta)
     hist_path = os.path.join(ckpt_dir, "imitation_history.json")
@@ -601,7 +612,30 @@ def main() -> None:
         default=1,
         help="vsids 教师：每 stride 次注册原子决策留 1 条",
     )
-    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument(
+        "--epochs",
+        type=int,
+        default=-1,
+        help="imitation 轮数；-1=训到收敛（默认；见 --imitation-patience）",
+    )
+    ap.add_argument(
+        "--imitation-patience",
+        type=int,
+        default=5,
+        help="imitation 早停 patience（epochs=-1 时；branch 相对提升不足则停）",
+    )
+    ap.add_argument(
+        "--imitation-tol",
+        type=float,
+        default=0.01,
+        help="imitation 早停相对提升阈值（默认 0.01=1%%）",
+    )
+    ap.add_argument(
+        "--imitation-max-epochs",
+        type=int,
+        default=10_000,
+        help="imitation epochs=-1 时的安全上限轮数",
+    )
     ap.add_argument(
         "--rl-iters",
         type=int,
@@ -737,18 +771,24 @@ def main() -> None:
 
     policy = BranchingPolicy()
     test_defer_logit = 0.0
+    imit_defer_logit = 0.0
     if args.imitation:
         from omt_branching.model.trainer import ImitationTrainer, TrainConfig
 
         imit_fp = _imitation_fingerprint(args)
-        if _try_load_imitation_ckpt(
+        loaded_meta = _try_load_imitation_ckpt(
             policy,
             args.ckpt_dir,
             imit_fp,
             device=device,
             force=bool(args.force_imitation),
-        ):
-            print("跳过 imitation（已从 checkpoint 恢复）")
+        )
+        if loaded_meta is not None:
+            imit_defer_logit = float(loaded_meta.get("defer_logit") or 0.0)
+            print(
+                f"跳过 imitation（已从 checkpoint 恢复）；"
+                f"defer_logit={imit_defer_logit:.4f}"
+            )
         else:
             lookahead_workers = args.test_workers
             paths = _smt2_abs_paths(dataset_dir, train_entries)
@@ -844,19 +884,41 @@ def main() -> None:
                     cache_only=not rebuild,
                 )
             exs = [e for e in raw_exs if e.bool_target_scores]
-            hist = ImitationTrainer(policy, TrainConfig(lr=5e-3, device=device)).fit(
-                exs, epochs=args.epochs
+            trainer = ImitationTrainer(
+                policy,
+                TrainConfig(
+                    lr=5e-3,
+                    device=device,
+                    patience=args.imitation_patience,
+                    tol=args.imitation_tol,
+                    max_epochs=args.imitation_max_epochs,
+                ),
             )
-            print(
-                f"{la_kind} imitation: {len(exs)} 样本, branch loss "
-                f"{hist[0].get('branch', 0):.3f} -> {hist[-1].get('branch', 0):.3f}"
+            epochs_desc = (
+                f"直到收敛(patience={args.imitation_patience}, "
+                f"tol={args.imitation_tol}, max={args.imitation_max_epochs})"
+                if args.epochs == -1
+                else f"{args.epochs} epochs"
             )
+            print(f"imitation 训练: {len(exs)} 样本, {epochs_desc}")
+            hist = trainer.fit(exs, epochs=args.epochs)
+            metric_rows = [h for h in hist if "branch" in h]
+            if metric_rows:
+                print(
+                    f"{la_kind} imitation: {len(exs)} 样本, branch loss "
+                    f"{metric_rows[0].get('branch', 0):.3f} -> "
+                    f"{metric_rows[-1].get('branch', 0):.3f} "
+                    f"({len(metric_rows)} epochs), "
+                    f"defer_logit={float(trainer.defer_logit):.4f}"
+                )
+            imit_defer_logit = float(trainer.defer_logit.detach().cpu())
             ckpt_path = _save_imitation_ckpt(
                 policy,
                 args.ckpt_dir,
                 imit_fp,
                 n_examples=len(exs),
                 hist=hist,
+                defer_logit=imit_defer_logit,
             )
             print(f"imitation checkpoint -> {ckpt_path}")
 
@@ -893,6 +955,16 @@ def main() -> None:
                 collect_batch_size=rl_batch,
             ),
         )
+        if imit_defer_logit != 0.0 or args.imitation:
+            with torch.no_grad():
+                rlt.defer_logit.copy_(
+                    torch.tensor(
+                        float(imit_defer_logit),
+                        dtype=rlt.defer_logit.dtype,
+                        device=rlt.defer_logit.device,
+                    )
+                )
+            print(f"RL 初始 defer_logit <- imitation ({imit_defer_logit:.4f})")
         mode = (
             f"进程并行×{rl_workers}（GNN 主进程排队全 GPU）"
             if rl_workers > 1
@@ -1016,6 +1088,8 @@ def main() -> None:
         "model cut rlimit": 0.0,
         "check rlimit": 0.0,
         "eval rlimit": 0.0,
+        "consequence rlimit": 0.0,
+        "rlimit with consequence": 0.0,
         "weighted rlimit": 0.0,
         "conflicts": 0.0,
         "decisions": 0.0,

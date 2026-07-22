@@ -10,10 +10,16 @@
    - 一侧全局最优、另一侧 unsat → 得分 ``0``（相位取全局最优侧）；
    - 其余：一侧全局最优、另一侧为更差的局部最优，按
      ``|局部最优 - 全局最优|`` 从大到小排序，得分从 ``n`` 递减、步长 1
-     （相位取全局最优侧）。
+     （相位取全局最优侧）；
+5. **defer 分**：``max(0, max_score - 2)``，与原子分一并写入样本（供 ListNet 含 defer）。
 
-非根采样：根评分完成后，将得分 ≥ 0 的原子按其相位固定为硬约束，再对根上
-得分 < 0 的原子重新打分；产出第二条 imitation 样本（图带部分赋值）。
+非根采样：与 defer 同一门槛——仅固定根上得分 **> defer_score** 的原子（连续排名下即
+评分前 2）；``check`` 取 model → Better-cut → 再对剩余原子**剪枝重评**（图断言含 cut）：
+
+- 正分原子：根上最优侧在 cut 后不变，只重解非最优侧；
+- 得分 0：两侧不变，保持 0；
+- 得分 ``-n``：可能一侧变为局部最优/unsat；若已发现一侧非（局部）全局最优，
+  则另一侧必为最优，无需再搜。
 
 缓存布局（与 split look-ahead 分离）::
 
@@ -46,6 +52,7 @@ from omt_branching.solver.decide_omt import (
     smt2_to_instance,
     solve_binary,
 )
+from omt_branching.solver.interfaces import Sense
 from omt_branching.solver.instance_gen import OMTInstance
 from omt_branching.solver.propagator_snapshot import (
     atom_key,
@@ -84,28 +91,34 @@ def save_objective_lookahead_result(
     opt_value,
     n_atoms: int,
     nonroot: dict | None = None,
+    defer_score: float | None = None,
 ) -> Path:
     path = objective_lookahead_path(dataset_dir, instance_id, split=split)
     path.parent.mkdir(parents=True, exist_ok=True)
+    dscore = (
+        float(defer_score)
+        if defer_score is not None
+        else _defer_score_from_scores(scores)
+    )
     payload = {
         "instance_id": instance_id,
         "split": split,
         "kind": "objective",
-        "version": 2,
+        "version": 3,
         "n_atoms": int(n_atoms),
         "opt_value": str(opt_value) if opt_value is not None else None,
         "scores": {str(k): float(v) for k, v in scores.items()},
         "phases": {str(k): bool(v) for k, v in phases.items()},
+        "defer_score": dscore,
         "nonroot": None,
     }
     if nonroot is not None:
+        nr_scores = nonroot.get("scores") or {}
         payload["nonroot"] = {
             "assignment": {
                 str(k): bool(v) for k, v in (nonroot.get("assignment") or {}).items()
             },
-            "scores": {
-                str(k): float(v) for k, v in (nonroot.get("scores") or {}).items()
-            },
+            "scores": {str(k): float(v) for k, v in nr_scores.items()},
             "phases": {
                 str(k): bool(v) for k, v in (nonroot.get("phases") or {}).items()
             },
@@ -113,6 +126,16 @@ def save_objective_lookahead_result(
             "opt_value": (
                 str(nonroot["opt_value"])
                 if nonroot.get("opt_value") is not None
+                else None
+            ),
+            "defer_score": float(
+                nonroot["defer_score"]
+                if nonroot.get("defer_score") is not None
+                else _defer_score_from_scores(nr_scores)
+            ),
+            "model_value": (
+                str(nonroot["model_value"])
+                if nonroot.get("model_value") is not None
                 else None
             ),
         }
@@ -138,30 +161,83 @@ def load_objective_lookahead_result(
         payload = json.load(f)
     if payload.get("kind") not in (None, "objective"):
         return None
+    scores = {str(k): float(v) for k, v in (payload.get("scores") or {}).items()}
+    defer = payload.get("defer_score")
+    if defer is None:
+        defer = _defer_score_from_scores(scores)
     nonroot_raw = payload.get("nonroot")
     nonroot = None
     if isinstance(nonroot_raw, dict) and nonroot_raw.get("scores"):
+        nr_scores = {
+            str(k): float(v) for k, v in (nonroot_raw.get("scores") or {}).items()
+        }
+        nr_defer = nonroot_raw.get("defer_score")
+        if nr_defer is None:
+            nr_defer = _defer_score_from_scores(nr_scores)
         nonroot = {
             "assignment": {
                 str(k): bool(v)
                 for k, v in (nonroot_raw.get("assignment") or {}).items()
             },
-            "scores": {
-                str(k): float(v) for k, v in (nonroot_raw.get("scores") or {}).items()
-            },
+            "scores": nr_scores,
             "phases": {
                 str(k): bool(v) for k, v in (nonroot_raw.get("phases") or {}).items()
             },
             "n_atoms": int(nonroot_raw.get("n_atoms") or 0),
             "opt_value": nonroot_raw.get("opt_value"),
+            "defer_score": float(nr_defer),
+            "model_value": nonroot_raw.get("model_value"),
         }
     return {
-        "scores": {str(k): float(v) for k, v in (payload.get("scores") or {}).items()},
+        "scores": scores,
         "phases": {str(k): bool(v) for k, v in (payload.get("phases") or {}).items()},
         "opt_value": payload.get("opt_value"),
         "n_atoms": payload.get("n_atoms"),
+        "defer_score": float(defer),
         "nonroot": nonroot,
+        "version": payload.get("version"),
     }
+
+
+def _defer_score_from_scores(scores: dict[str, float]) -> float:
+    """defer 教师分：``max(0, max_score - 2)``；无原子分时为 0。"""
+    if not scores:
+        return 0.0
+    return float(max(0.0, max(scores.values()) - 2.0))
+
+
+def _z3_num(ref) -> Fraction:
+    if z3.is_int_value(ref):
+        return Fraction(ref.as_long())
+    if z3.is_rational_value(ref):
+        return Fraction(ref.numerator_as_long(), ref.denominator_as_long())
+    return Fraction(str(ref))
+
+
+def _check_model_better_cut(
+    hard: list,
+    objective,
+    sense: Sense,
+) -> tuple[Optional[Fraction], object | None]:
+    """对当前硬约束 ``check`` 取 model，构造 OMT 风格 Better-cut。
+
+    返回 ``(model_value, cut_expr)``；unsat 或无法求值时 ``(None, None)``。
+    """
+    s = z3.Solver()
+    s.add(*hard)
+    if s.check() != z3.sat:
+        return None, None
+    m = s.model()
+    val_ref = m.eval(objective, model_completion=True)
+    try:
+        model_val = _z3_num(val_ref)
+    except Exception:
+        return None, None
+    if sense is Sense.MAX:
+        cut = objective > val_ref
+    else:
+        cut = objective < val_ref
+    return model_val, cut
 
 
 def _as_fraction(v) -> Optional[Fraction]:
@@ -200,6 +276,66 @@ def _solve_opt(
     return _as_fraction(res.get("value")), status
 
 
+def _finalize_atom_scores(
+    n: int,
+    unaffected: list[str],
+    failed_lit: list[tuple[str, bool]],
+    impactful: list[tuple[str, Fraction, bool]],
+) -> tuple[dict[str, float], dict[str, bool]]:
+    """由分类桶生成得分/相位（n 为参与评分的原子数）。"""
+    scores: dict[str, float] = {}
+    phases: dict[str, bool] = {}
+    for k in unaffected:
+        scores[k] = float(-n)
+        phases[k] = True
+    for k, ph in failed_lit:
+        scores[k] = 0.0
+        phases[k] = ph
+    impactful.sort(key=lambda row: (-row[1], row[0]))
+    rank = n
+    for k, _gap, ph in impactful:
+        scores[k] = float(rank)
+        phases[k] = ph
+        rank -= 1
+    return scores, phases
+
+
+def _classify_side_pair(
+    k: str,
+    *,
+    opt: Fraction,
+    st_t: str,
+    val_t: Optional[Fraction],
+    st_f: str,
+    val_f: Optional[Fraction],
+    unaffected: list[str],
+    failed_lit: list[tuple[str, bool]],
+    impactful: list[tuple[str, Fraction, bool]],
+) -> None:
+    """把真/假两侧结果写入三个分类桶（跳过 timeout/error）。"""
+    if st_t not in ("sat", "unsat") or st_f not in ("sat", "unsat"):
+        return
+    t_opt = st_t == "sat" and val_t is not None and val_t == opt
+    f_opt = st_f == "sat" and val_f is not None and val_f == opt
+    t_unsat = st_t == "unsat"
+    f_unsat = st_f == "unsat"
+
+    if t_opt and f_opt:
+        unaffected.append(k)
+        return
+    if (t_opt and f_unsat) or (f_opt and t_unsat):
+        failed_lit.append((k, True if t_opt else False))
+        return
+    if t_opt and st_f == "sat" and val_f is not None and val_f != opt:
+        impactful.append((k, abs(val_f - opt), True))
+        return
+    if f_opt and st_t == "sat" and val_t is not None and val_t != opt:
+        impactful.append((k, abs(val_t - opt), False))
+        return
+    if st_t == "sat" and st_f == "sat" and val_t is not None and val_f is not None:
+        raise AssertionError("两侧均非全局最优但仍 sat")
+
+
 def _score_atoms_on_hard(
     inst: OMTInstance,
     hard_base: list,
@@ -230,52 +366,111 @@ def _score_atoms_on_hard(
             z3_path=z3_path,
             timeout_s=timeout_s,
         )
+        _classify_side_pair(
+            k,
+            opt=opt,
+            st_t=st_t,
+            val_t=val_t,
+            st_f=st_f,
+            val_f=val_f,
+            unaffected=unaffected,
+            failed_lit=failed_lit,
+            impactful=impactful,
+        )
 
-        if st_t not in ("sat", "unsat") or st_f not in ("sat", "unsat"):
+    return _finalize_atom_scores(n, unaffected, failed_lit, impactful)
+
+
+def _score_rem_atoms_after_cut(
+    inst: OMTInstance,
+    hard_cut: list,
+    rem_keys: list[str],
+    key_to_atom: dict,
+    root_scores: dict[str, float],
+    root_phases: dict[str, bool],
+    opt_cut: Fraction,
+    *,
+    z3_path: str | None = None,
+    timeout_s: int = 120,
+) -> tuple[dict[str, float], dict[str, bool]]:
+    """非根剪枝重评：利用根评分跳过不变的原子侧。
+
+    前提：Better-cut 后仍 sat 且 ``opt_cut`` 可达（调用方已保证）；固定的前 2
+    原子取根最优相位后，根上「仅一侧最优」的原子其最优侧不变。
+    """
+    n = len(rem_keys)
+    if n == 0:
+        return {}, {}
+
+    unaffected: list[str] = []
+    failed_lit: list[tuple[str, bool]] = []
+    impactful: list[tuple[str, Fraction, bool]] = []
+
+    for k in rem_keys:
+        a = key_to_atom[k]
+        sc = float(root_scores.get(k, float("nan")))
+        if sc != sc:  # NaN：根上无分，跳过
             continue
 
-        t_opt = st_t == "sat" and val_t is not None and val_t == opt
-        f_opt = st_f == "sat" and val_f is not None and val_f == opt
-        t_unsat = st_t == "unsat"
-        f_unsat = st_f == "unsat"
-
-        if t_opt and f_opt:
-            unaffected.append(k)
+        # 得分 0：两侧不变
+        if sc == 0.0:
+            failed_lit.append((k, bool(root_phases.get(k, True))))
             continue
 
-        if (t_opt and f_unsat) or (f_opt and t_unsat):
-            failed_lit.append((k, True if t_opt else False))
+        # 正分：只重解非最优侧；最优侧仍达 opt_cut
+        if sc > 0.0:
+            opt_ph = bool(root_phases[k])
+            non_opt_lit = z3.Not(a) if opt_ph else a
+            val_o, st_o = _solve_opt(
+                _forced_instance(inst, hard_cut, non_opt_lit),
+                z3_path=z3_path,
+                timeout_s=timeout_s,
+            )
+            if st_o not in ("sat", "unsat"):
+                continue
+            if st_o == "unsat":
+                failed_lit.append((k, opt_ph))
+            elif val_o is not None and val_o == opt_cut:
+                unaffected.append(k)
+            elif val_o is not None:
+                impactful.append((k, abs(val_o - opt_cut), opt_ph))
             continue
 
-        if t_opt and st_f == "sat" and val_f is not None and val_f != opt:
-            impactful.append((k, abs(val_f - opt), True))
+        # 得分 -n：一侧非最优 ⇒ 另一侧必为最优，可剪掉第二次搜索
+        val_t, st_t = _solve_opt(
+            _forced_instance(inst, hard_cut, a),
+            z3_path=z3_path,
+            timeout_s=timeout_s,
+        )
+        if st_t not in ("sat", "unsat"):
             continue
-        if f_opt and st_t == "sat" and val_t is not None and val_t != opt:
-            impactful.append((k, abs(val_t - opt), False))
+        t_opt = st_t == "sat" and val_t is not None and val_t == opt_cut
+        if not t_opt:
+            # 假侧必为最优，无需求解
+            if st_t == "unsat":
+                failed_lit.append((k, False))
+            elif val_t is not None:
+                impactful.append((k, abs(val_t - opt_cut), False))
             continue
 
-        if st_t == "sat" and st_f == "sat" and val_t is not None and val_f is not None:
-            raise AssertionError("两侧均非全局最优但仍 sat")
+        val_f, st_f = _solve_opt(
+            _forced_instance(inst, hard_cut, z3.Not(a)),
+            z3_path=z3_path,
+            timeout_s=timeout_s,
+        )
+        _classify_side_pair(
+            k,
+            opt=opt_cut,
+            st_t=st_t,
+            val_t=val_t,
+            st_f=st_f,
+            val_f=val_f,
+            unaffected=unaffected,
+            failed_lit=failed_lit,
+            impactful=impactful,
+        )
 
-    scores: dict[str, float] = {}
-    phases: dict[str, bool] = {}
-
-    for k in unaffected:
-        scores[k] = float(-n)
-        phases[k] = True
-
-    for k, ph in failed_lit:
-        scores[k] = 0.0
-        phases[k] = ph
-
-    impactful.sort(key=lambda row: (-row[1], row[0]))
-    rank = n
-    for k, _gap, ph in impactful:
-        scores[k] = float(rank)
-        phases[k] = ph
-        rank -= 1
-
-    return scores, phases
+    return _finalize_atom_scores(n, unaffected, failed_lit, impactful)
 
 
 def objective_lookahead_scores(
@@ -325,6 +520,22 @@ def objective_lookahead_scores(
     return scores, phases, opt, n, nonroot
 
 
+def _keys_above_defer(
+    scores: dict[str, float],
+    *,
+    key_to_atom: dict | None = None,
+) -> tuple[list[str], float]:
+    """与 defer 统一：得分严格大于 ``defer_score`` 的原子（通常为评分前 2）。"""
+    defer = _defer_score_from_scores(scores)
+    keys = [
+        k for k, sc in scores.items()
+        if sc > defer and (key_to_atom is None or k in key_to_atom)
+    ]
+    # 同分时按键名稳定排序，再按分数降序（前 2 语义清晰）
+    keys.sort(key=lambda k: (-scores[k], k))
+    return keys, defer
+
+
 def _sample_nonroot_scores(
     inst: OMTInstance,
     *,
@@ -336,28 +547,45 @@ def _sample_nonroot_scores(
     z3_path: str | None,
     timeout_s: int,
 ) -> dict | None:
-    """固定根上得分 ≥ 0 的原子（按其相位），对得分 < 0 的原子重打分。"""
-    nonneg_keys = [k for k, sc in root_scores.items() if sc >= 0 and k in key_to_atom]
-    neg_keys = [k for k, sc in root_scores.items() if sc < 0 and k in key_to_atom]
-    if not nonneg_keys or not neg_keys:
+    """固定根上得分 > defer 的原子（前 2）后：check→model→Better-cut，剪枝重评剩余。"""
+    fix_keys, root_defer = _keys_above_defer(root_scores, key_to_atom=key_to_atom)
+    rem_keys = [k for k in key_to_atom if k not in fix_keys]
+    if not fix_keys or not rem_keys:
         return None
 
-    assignment = {k: bool(root_phases[k]) for k in nonneg_keys}
+    assignment = {k: bool(root_phases[k]) for k in fix_keys if k in root_phases}
+    if len(assignment) != len(fix_keys):
+        return None
     lits = []
-    for k in nonneg_keys:
+    for k in fix_keys:
         a = key_to_atom[k]
         lits.append(a if assignment[k] else z3.Not(a))
     hard_nr = list(hard_use) + lits
-    rem_atoms = [key_to_atom[k] for k in neg_keys]
 
-    # 固定相位均朝向全局最优侧，受限问题最优应仍为 opt；再解一次作校验。
-    base_nr = replace(inst, hard=hard_nr, instance_id=f"{inst.instance_id}__nr")
-    opt_nr, st = _solve_opt(base_nr, z3_path=z3_path, timeout_s=timeout_s)
-    if opt_nr is None or st != "sat":
+    model_val, cut = _check_model_better_cut(
+        hard_nr, inst.objective, inst.sense
+    )
+    if model_val is None or cut is None:
+        return None
+    # model 已是全局最优 ⇒ Better-cut 后 unsat，由下方 opt_cut 求解捕获。
+    hard_cut = hard_nr + [cut]
+
+    # cut 后仍须可达到（更优）最优；若 model 已是子问题最优则 cut→UNSAT，跳过。
+    base_cut = replace(inst, hard=hard_cut, instance_id=f"{inst.instance_id}__nr_cut")
+    opt_cut, st = _solve_opt(base_cut, z3_path=z3_path, timeout_s=timeout_s)
+    if opt_cut is None or st != "sat":
         return None
 
-    scores_nr, phases_nr = _score_atoms_on_hard(
-        inst, hard_nr, rem_atoms, opt_nr, z3_path=z3_path, timeout_s=timeout_s
+    scores_nr, phases_nr = _score_rem_atoms_after_cut(
+        inst,
+        hard_cut,
+        rem_keys,
+        key_to_atom,
+        root_scores,
+        root_phases,
+        opt_cut,
+        z3_path=z3_path,
+        timeout_s=timeout_s,
     )
     if not scores_nr:
         return None
@@ -365,9 +593,49 @@ def _sample_nonroot_scores(
         "assignment": assignment,
         "scores": scores_nr,
         "phases": phases_nr,
-        "n_atoms": len(rem_atoms),
-        "opt_value": opt_nr,
+        "n_atoms": len(rem_keys),
+        "opt_value": opt_cut,
+        "defer_score": _defer_score_from_scores(scores_nr),
+        "root_defer_score": root_defer,
+        "model_value": model_val,
+        "hard_for_graph": hard_cut,
     }
+
+
+def _cut_from_stored_value(objective, sense: Sense, model_val: Fraction):
+    """由缓存的 model 目标值重建 Better-cut（与当时 model.eval 结果一致）。"""
+    if model_val.denominator == 1:
+        ref = z3.IntVal(int(model_val))
+    else:
+        ref = z3.RealVal(int(model_val.numerator), int(model_val.denominator))
+    if sense is Sense.MAX:
+        return objective > ref
+    return objective < ref
+
+
+def _nonroot_graph_hard(
+    inst: OMTInstance,
+    hard_use: list,
+    nonroot: dict,
+) -> list:
+    """从非根缓存的 assignment + model_value 重建含 Better-cut 的图断言。"""
+    from omt_branching.solver.propagator_snapshot import collect_clause_atoms
+
+    if nonroot.get("hard_for_graph") is not None:
+        return list(nonroot["hard_for_graph"])
+    assignment = nonroot.get("assignment") or {}
+    key_to_atom = {atom_key(a): a for a in collect_clause_atoms(hard_use)}
+    lits = []
+    for k, ph in assignment.items():
+        a = key_to_atom.get(k)
+        if a is None:
+            continue
+        lits.append(a if ph else z3.Not(a))
+    hard_nr = list(hard_use) + lits
+    mv = _as_fraction(nonroot.get("model_value"))
+    if mv is None:
+        return hard_nr
+    return hard_nr + [_cut_from_stored_value(inst.objective, inst.sense, mv)]
 
 
 def _scores_to_example(
@@ -376,6 +644,7 @@ def _scores_to_example(
     phases: dict[str, bool],
     *,
     assignment: dict[str, bool] | None = None,
+    defer_score: float | None = None,
 ) -> RankingExample | None:
     snap, _amap = build_bool_snapshot(hard_for_graph, assignment=assignment or {})
     graph = GraphBuilder(DEFAULT_FEATURE_SPEC).build(snap)
@@ -392,7 +661,17 @@ def _scores_to_example(
             pts[loc] = ph
     if not bts:
         return None
-    return RankingExample(graph=graph, bool_target_scores=bts, phase_targets=pts)
+    dscore = (
+        float(defer_score)
+        if defer_score is not None
+        else _defer_score_from_scores(scores)
+    )
+    return RankingExample(
+        graph=graph,
+        bool_target_scores=bts,
+        phase_targets=pts,
+        defer_target_score=dscore,
+    )
 
 
 def build_objective_lookahead_examples(
@@ -409,6 +688,9 @@ def build_objective_lookahead_examples(
     if cached is not None:
         scores = cached["scores"]
         phases = cached["phases"]
+        defer_score = cached.get("defer_score")
+        if defer_score is None:
+            defer_score = _defer_score_from_scores(scores)
         nonroot = cached.get("nonroot") if include_nonroot else None
     else:
         scores, phases, _opt, _n, nonroot = objective_lookahead_scores(
@@ -418,20 +700,28 @@ def build_objective_lookahead_examples(
             timeout_s=timeout_s,
             sample_nonroot=include_nonroot,
         )
+        defer_score = _defer_score_from_scores(scores)
         if not include_nonroot:
             nonroot = None
 
     out: list[RankingExample] = []
     if scores:
-        ex = _scores_to_example(hard_use, scores, phases)
+        ex = _scores_to_example(
+            hard_use, scores, phases, defer_score=float(defer_score)
+        )
         if ex is not None:
             out.append(ex)
     if include_nonroot and nonroot and nonroot.get("scores"):
+        hard_nr_graph = _nonroot_graph_hard(inst, hard_use, nonroot)
+        nr_defer = nonroot.get("defer_score")
+        if nr_defer is None:
+            nr_defer = _defer_score_from_scores(nonroot["scores"])
         ex_nr = _scores_to_example(
-            hard_use,
+            hard_nr_graph,
             nonroot["scores"],
             nonroot["phases"],
             assignment=nonroot.get("assignment") or {},
+            defer_score=float(nr_defer),
         )
         if ex_nr is not None:
             out.append(ex_nr)
@@ -481,6 +771,7 @@ def _compute_and_maybe_cache(
             opt_value=opt,
             n_atoms=n,
             nonroot=nonroot,
+            defer_score=_defer_score_from_scores(scores),
         )
     if not scores:
         return []
@@ -490,6 +781,7 @@ def _compute_and_maybe_cache(
         cached={
             "scores": scores,
             "phases": phases,
+            "defer_score": _defer_score_from_scores(scores),
             "nonroot": nonroot,
         },
     )

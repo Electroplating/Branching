@@ -216,7 +216,8 @@ def test_root_forced_assignment_after_cut():
     a, b = x >= 5, x <= 2
     asserts = [x >= 0, x <= 10, z3.Or(a, b)]
     # cut x >= 6 ⇒ a 真、b 假
-    forced = root_forced_assignment(asserts + [x >= 6])
+    forced, crl = root_forced_assignment(asserts + [x >= 6])
+    assert isinstance(crl, int) and crl >= 0
     assert forced.get(atom_key(a)) is True
     assert forced.get(atom_key(b)) is False
 

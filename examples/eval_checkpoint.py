@@ -131,6 +131,8 @@ def main() -> None:
         "model cut rlimit": 0.0,
         "check rlimit": 0.0,
         "eval rlimit": 0.0,
+        "consequence rlimit": 0.0,
+        "rlimit with consequence": 0.0,
         "weighted rlimit": 0.0,
         "conflicts": 0.0,
         "decisions": 0.0,

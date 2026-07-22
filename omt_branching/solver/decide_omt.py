@@ -58,20 +58,24 @@ def solve_omt_with_decider(
     ref_rlimit: int | None = None,
     sample: bool = False,
     attach_propagator: bool = True,
+    propagator_factory=None,
 ) -> dict:
     """OMT 线性搜索；默认在独立 :class:`z3.Context` 内运行，避免跨线程/跨求解共享表达式。
 
     始终对硬约束做轻量预处理（``prepare_propagator_formula``），并在简化后的断言上
     ``check``。
 
-    - ``attach_propagator=True``（默认）：挂 ``LearnedDecidePropagator``，只注册析取子句
-      （字面量数 ≥ 2）中的原子。``decider_factory=None`` 时 decider 恒 defer（公平
-      VSIDS 臂）；否则 ``decider_factory(assertions) -> decider``（learned 臂）。
+    - ``attach_propagator=True``（默认）：挂 propagator，只注册析取子句（字面量数 ≥ 2）
+      中的原子。默认类为 ``LearnedDecidePropagator``；可用 ``propagator_factory(s, atoms,
+      decider)`` 替换（例如带 decide 轨迹日志的子类）。``decider_factory=None`` 时
+      decider 恒 defer（公平 VSIDS 臂）；否则 ``decider_factory(assertions) -> decider``。
     - ``attach_propagator=False``：不挂 propagator（check-sat-loop 臂）；忽略
-      ``decider_factory``。
+      ``decider_factory`` / ``propagator_factory``。
     - 每次 better-cut 写入 Solver 后，若 decider 实现 ``add_hard``，会把 cut 并入 GNN
-      建图断言，并刷新根级 ``consequences`` 强制赋值（跨 cut 简化建图）；不额外
-      ``prop.add``：单元 cut 本就不注册。
+      建图断言，并在**独立 Context** 上刷新根级 ``consequences`` 强制赋值（跨 cut
+      简化建图）；不额外 ``prop.add``：单元 cut 本就不注册。consequences 的 rlimit
+      记入返回值 ``consequence rlimit``，**不计入**主搜索 ``rlimit`` /
+      ``weighted rlimit``（RL 奖励默认用后者；完整代价见 ``rlimit with consequence``）。
 
     若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时提前返回（未达最优时
     reward 侧多为 -1.0，返回 dict 含 ``truncated=True``）；未给定时不做该剪枝。
@@ -94,7 +98,10 @@ def solve_omt_with_decider(
             decider = _defer_always
         else:
             decider = decider_factory(hard_use)
-        prop = LearnedDecidePropagator(s, atoms, decider)
+        if propagator_factory is not None:
+            prop = propagator_factory(s, atoms, decider)
+        else:
+            prop = LearnedDecidePropagator(s, atoms, decider)
     decider_factory_rlimit = _stat(s, "rlimit count") - rlimit
     rlimit += decider_factory_rlimit
 
@@ -177,6 +184,14 @@ def solve_omt_with_decider(
     stats["model cut rlimit"] = sum(model_rlimit) - model_rlimit[0]
     stats["check rlimit"] = sum(check_rlimit)
     stats["eval rlimit"] = sum(eval_rlimit)
+    # 建图用 consequences（独立 Context）；与主搜索 rlimit 并列，RL 默认不计入
+    consequence_rlimit = 0
+    if prop is not None:
+        consequence_rlimit = int(
+            getattr(prop.decider, "consequence_rlimit", 0) or 0
+        )
+    stats["consequence rlimit"] = consequence_rlimit
+    stats["rlimit with consequence"] = int(stats["rlimit"]) + consequence_rlimit
 
     return stats
 

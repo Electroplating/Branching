@@ -34,6 +34,8 @@ class RankingExample:
     bool_target_scores: dict[int, float] = field(default_factory=dict)
     # phase 标签：local_idx -> 取真(True)/取假(False)
     phase_targets: dict[int, bool] = field(default_factory=dict)
+    # defer 教师分（与原子分同一 ListNet；对应 SamplingPolicyDecider 的 defer_logit）
+    defer_target_score: float | None = None
     # 整数 B&B 标签：local_idx -> 偏好权重；方向 local_idx -> 向上(True)
     int_target_scores: dict[int, float] = field(default_factory=dict)
     int_dir_targets: dict[int, bool] = field(default_factory=dict)
@@ -54,16 +56,25 @@ class TrainConfig:
     grad_clip: float = 5.0
     device: str = field(default_factory=gnn_device)
     accum_steps: int = 1  # 梯度累积步数，>1 时每 accum_steps 次 forward 才 backward 一次
+    # epochs=-1 时早停
+    patience: int = 5
+    tol: float = 0.01  # branch（或 total loss）相对提升阈值
+    max_epochs: int = 10_000
 
 
 class ImitationTrainer:
-    """封装优化器与多任务损失。"""
+    """封装优化器与多任务损失；可选学习 ``defer_logit``（与 RL 同构）。"""
 
     def __init__(self, policy: BranchingPolicy, config: TrainConfig = TrainConfig()):
         self.policy = policy.to(config.device)
         self.config = config
+        self.defer_logit = torch.nn.Parameter(
+            torch.zeros((), dtype=torch.float32, device=config.device)
+        )
         self.opt = torch.optim.Adam(
-            policy.parameters(), lr=config.lr, weight_decay=config.weight_decay
+            list(policy.parameters()) + [self.defer_logit],
+            lr=config.lr,
+            weight_decay=config.weight_decay,
         )
 
     # ------------------------------------------------------------------ #
@@ -76,17 +87,44 @@ class ImitationTrainer:
         if backward:
             self.opt.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.policy.parameters()) + [self.defer_logit],
+                self.config.grad_clip,
+            )
             self.opt.step()
             return parts
         return parts, loss
 
-    def fit(self, examples: Iterable[RankingExample], epochs: int = 1,
-            log_every: int = 0) -> list[dict[str, float]]:
+    def fit(
+        self,
+        examples: Iterable[RankingExample],
+        epochs: int = 1,
+        log_every: int = 0,
+        *,
+        patience: int | None = None,
+        tol: float | None = None,
+        max_epochs: int | None = None,
+    ) -> list[dict[str, float]]:
+        """训练 ``epochs`` 轮；``epochs=-1`` 时训到 branch/loss 相对提升不足为止。"""
         examples = list(examples)
+        if not examples:
+            return []
         history: list[dict[str, float]] = []
-        with tqdm(total = epochs * len(examples), desc="imit_train") as pbar:
-            for ep in range(epochs):
+        pat = self.config.patience if patience is None else int(patience)
+        tol_v = self.config.tol if tol is None else float(tol)
+        cap = self.config.max_epochs if max_epochs is None else int(max_epochs)
+        if epochs == -1:
+            n_epochs = max(1, cap)
+            early = True
+        else:
+            n_epochs = max(1, int(epochs))
+            early = False
+
+        best = None
+        stall = 0
+        pbar_total = None if early else n_epochs * len(examples)
+        with tqdm(total=pbar_total, desc="imit_train") as pbar:
+            for ep in range(n_epochs):
                 agg: dict[str, float] = {}
                 self.opt.zero_grad()
                 for i, ex in enumerate(examples):
@@ -95,14 +133,49 @@ class ImitationTrainer:
                     for k, v in parts.items():
                         agg[k] = agg.get(k, 0.0) + v
                     if (i + 1) % self.config.accum_steps == 0 or (i + 1) == len(examples):
-                        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.grad_clip)
+                        torch.nn.utils.clip_grad_norm_(
+                            list(self.policy.parameters()) + [self.defer_logit],
+                            self.config.grad_clip,
+                        )
                         self.opt.step()
                         self.opt.zero_grad()
                     if log_every and (i + 1) % log_every == 0:
                         print(f"[epoch {ep} step {i + 1}] loss={parts['loss']:.4f}")
                     pbar.update(1)
                 n = max(1, len(examples))
-                history.append({k: v / n for k, v in agg.items()})
+                row = {k: v / n for k, v in agg.items()}
+                history.append(row)
+                metric = float(row.get("branch", row.get("loss", 0.0)))
+                if early:
+                    if best is None:
+                        best = metric
+                        stall = 0
+                    else:
+                        scale = abs(best) + 1e-8
+                        if (best - metric) / scale > tol_v:
+                            best = metric
+                            stall = 0
+                        else:
+                            stall += 1
+                    pbar.set_postfix(
+                        ep=ep + 1,
+                        branch=f"{metric:.4f}",
+                        best=f"{best:.4f}",
+                        stall=f"{stall}/{pat}",
+                    )
+                    if stall >= pat:
+                        history.append(
+                            {
+                                "event": "early_stop",
+                                "epoch": ep + 1,
+                                "best_branch": best,
+                                "patience": pat,
+                                "tol": tol_v,
+                            }
+                        )
+                        break
+                else:
+                    pbar.set_postfix(ep=ep + 1, branch=f"{metric:.4f}")
         return history
 
     # ------------------------------------------------------------------ #
@@ -111,12 +184,18 @@ class ImitationTrainer:
         parts: dict[str, float] = {}
         total = torch.zeros((), device=dev)
 
-        # --- 布尔 branching ranking (soft CE / KL) ---
-        l_branch = _ranking_loss(out.bool_branch_scores, ex.bool_target_scores,
-                                 out.candidate_bool_local, dev)
+        # --- 布尔 branching ranking (soft CE / KL)，可选拼接 defer ---
+        l_branch = _ranking_loss(
+            out.bool_branch_scores,
+            ex.bool_target_scores,
+            out.candidate_bool_local,
+            dev,
+            defer_logit=self.defer_logit,
+            defer_target=ex.defer_target_score,
+        )
         if l_branch is not None:
             total = total + l_branch
-            parts["branch"] = float(l_branch)
+            parts["branch"] = float(l_branch.detach())
 
         # --- phase BCE ---
         l_phase = _bce_loss(out.phase_logits, ex.phase_targets, dev)
@@ -160,15 +239,26 @@ class ImitationTrainer:
             parts["aux"] = float(l_aux)
 
         parts["loss"] = float(total)
+        parts["defer_logit"] = float(self.defer_logit.detach().cpu())
         return total, parts
 
 
 # --------------------------------------------------------------------------- #
 # 损失工具
 # --------------------------------------------------------------------------- #
-def _ranking_loss(scores: torch.Tensor, target_scores: dict[int, float],
-                  candidate_local: list[int], dev) -> Optional[torch.Tensor]:
-    """候选集合上的 soft 交叉熵 (ListNet)：KL(target || softmax(scores))。"""
+def _ranking_loss(
+    scores: torch.Tensor,
+    target_scores: dict[int, float],
+    candidate_local: list[int],
+    dev,
+    *,
+    defer_logit: torch.Tensor | None = None,
+    defer_target: float | None = None,
+) -> Optional[torch.Tensor]:
+    """候选集合上的 soft 交叉熵 (ListNet)：KL(target || softmax(scores))。
+
+    若提供 ``defer_target``，在 logits/目标前拼接 defer（与 RL SamplingPolicyDecider 对齐）。
+    """
     if scores.numel() == 0 or not target_scores:
         return None
     cand = candidate_local or sorted(target_scores.keys())
@@ -178,6 +268,11 @@ def _ranking_loss(scores: torch.Tensor, target_scores: dict[int, float],
     idx = torch.tensor(cand, dtype=torch.long, device=dev)
     logits = scores[idx]
     tgt = torch.tensor([target_scores.get(c, 0.0) for c in cand], device=dev)
+    if defer_target is not None and defer_logit is not None:
+        logits = torch.cat([defer_logit.reshape(1).to(dev), logits])
+        tgt = torch.cat(
+            [torch.tensor([float(defer_target)], device=dev), tgt]
+        )
     if float(tgt.abs().sum()) == 0.0:
         return None
     tgt = F.softmax(tgt, dim=0)

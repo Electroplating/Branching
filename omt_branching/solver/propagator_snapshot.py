@@ -12,7 +12,9 @@
   剪掉已定候选，供 GNN 在当前部分赋值下重建图（不调用 z3 理论引擎）。
 - :func:`root_forced_assignment` —— OMT better-cut 后在根状态用 ``consequences``
   求硬断言强制的原子赋值；经 :func:`merge_root_assignment` 并入搜索 trail，
-  供跨 cut 简化建图（剪掉根级已定候选 / 投影子句）。
+  供跨 cut 简化建图（剪掉根级已定候选 / 投影子句）。在**独立** ``z3.Context``
+  上求解，不污染主 Solver 的 ``rlimit``；自身消耗作为返回值第二项，由 decider
+  累计为 ``consequence rlimit``（与主搜索 ``rlimit`` 并列，RL 奖励默认不计入）。
 
 性能：``atom_key`` 按 ``id(expr)`` 缓存；静态 snapshot LRU；``_linear`` 仅单次建图局部缓存。
 """
@@ -235,34 +237,51 @@ def _consequence_literal_assignment(imps) -> dict[str, bool]:
     return out
 
 
+def _solver_rlimit(s) -> int:
+    """读取 Solver 当前 ``rlimit count``（缺失则为 0）。"""
+    st = s.statistics()
+    for k in st.keys():
+        if k == "rlimit count":
+            return int(st.get_key_value(k))
+    return 0
+
+
 def root_forced_assignment(
     assertions,
     atoms=None,
     *,
     max_atoms: Optional[int] = None,
-) -> dict[str, bool]:
+) -> tuple[dict[str, bool], int]:
     """根状态（无决策假设）下，用 z3 ``consequences`` 求被硬断言强制的原子赋值。
 
     典型用途：OMT 线性搜索每次 better-cut 并入断言后，刷新根级 forced 集合，
     再经 :func:`merge_root_assignment` 喂给 :func:`build_bool_snapshot`，投影子句并
-    剪掉已定候选。失败或无原子时返回空 dict（不影响后续求解）。
+    剪掉已定候选。失败或无原子时返回 ``({}, 0)``（不影响后续求解）。
+
+    在**独立** :class:`z3.Context` 上 ``translate`` 后求解，避免与主 OMT Solver
+    共享 Context 导致 ``rlimit count`` 被计入主搜索。返回
+    ``(forced_assignment, consequence_rlimit)``，后者仅反映本次 consequences 消耗。
     """
     assertions = list(assertions)
     if not assertions:
-        return {}
+        return {}, 0
     atom_exprs = list(atoms) if atoms is not None else collect_atoms(assertions)
     if max_atoms is not None:
         atom_exprs = atom_exprs[: max(0, int(max_atoms))]
     if not atom_exprs:
-        return {}
-    ctx = assertions[0].ctx
+        return {}, 0
+    ctx = z3.Context()
     try:
+        as_iso = [a.translate(ctx) for a in assertions]
+        atoms_iso = [a.translate(ctx) for a in atom_exprs]
         s = z3.Solver(ctx=ctx)
-        s.add(*assertions)
-        _res, imps = s.consequences([], atom_exprs)
+        s.add(*as_iso)
+        r0 = _solver_rlimit(s)
+        _res, imps = s.consequences([], atoms_iso)
+        r1 = _solver_rlimit(s)
+        return _consequence_literal_assignment(imps), max(0, r1 - r0)
     except z3.Z3Exception:
-        return {}
-    return _consequence_literal_assignment(imps)
+        return {}, 0
 
 
 def merge_root_assignment(

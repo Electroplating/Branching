@@ -428,6 +428,8 @@ class SamplingPolicyDecider:
         self.steps: list = []
         # 跨 cut 根级强制赋值（add_hard 后由 consequences 刷新）
         self._root_fixed: dict[str, bool] = {}
+        # 独立 Context 上 consequences 累计消耗（不计入主 Solver rlimit）
+        self.consequence_rlimit: int = 0
 
     def force_refocus(self) -> None:
         """清空图/分数/粘性窗，使下次 decide 立刻跑 GNN。"""
@@ -446,11 +448,14 @@ class SamplingPolicyDecider:
         """并入硬约束（如 better-cut），刷新根级 forced，并强制下次 decide refocus。
 
         用 :func:`root_forced_assignment` 在新断言上求根级强制原子，供后续建图投影。
+        consequences 在独立 Context 运行；其 rlimit 累加到 ``consequence_rlimit``。
         """
         if not exprs:
             return
         self.assertions.extend(exprs)
-        self._root_fixed = root_forced_assignment(self.assertions)
+        forced, crl = root_forced_assignment(self.assertions)
+        self._root_fixed = forced
+        self.consequence_rlimit += int(crl)
         self.force_refocus()
 
     def on_backtrack(self, num_scopes: int = 1) -> None:
