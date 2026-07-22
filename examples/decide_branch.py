@@ -12,7 +12,9 @@ check-sat-loop / VSIDS / learned 相对参考的正确性（match）与 rlimit/c
 ``python -m examples.solve_dataset_binary`` 写入 ``ref/<split>/<id>.json``。
 
 RL 微调默认在 ``eval/`` 验证集上按 ``mean_reward`` 早停：``--rl-iters N`` 最多 N 轮
-（收敛可提前结束）；``--rl-iters -1`` 训到收敛为止。验证集可用::
+（收敛可提前结束）；``--rl-iters -1`` 训到收敛为止。验证集 learned 默认**概率采样**
+（与 collect 同分布），``--eval-argmax`` 改为贪心；测试集默认 **argmax**，
+``--test-sample`` 改为概率采样。验证集可用::
 
     python -m examples.generate_dataset --append-eval --eval 10 --min-vars 4 --max-vars 5
     python -m examples.solve_dataset_binary --split eval
@@ -344,10 +346,12 @@ def _make_eval_decider_factory(
     defer_logit: float,
     sticky_window: bool,
     *,
+    sample: bool,
     infer_pool=None,
 ):
-    """验证/测试：与训练同构的 SamplingPolicyDecider，``sample=False``（可 defer）。
+    """验证/测试：与训练同构的 SamplingPolicyDecider（可 defer）。
 
+    ``sample=True`` 为概率采样（含 defer 的 ``log n``）；``False`` 为 argmax。
     ``infer_pool`` 非空时 GNN 走主进程 GPU 服务，本进程仅用 CPU 占位策略。
     """
     defer = torch.nn.Parameter(
@@ -360,7 +364,7 @@ def _make_eval_decider_factory(
             defer,
             assertions,
             refocus,
-            sample=False,
+            sample=bool(sample),
             device=device,
             sticky_window=sticky_window,
             infer_pool=infer_pool,
@@ -376,6 +380,7 @@ def _eval_policy_and_factory(
     defer_logit: float,
     sticky_window: bool,
     *,
+    sample: bool,
     use_remote: bool,
 ):
     """构造 eval 用 policy + decider_factory（本地 GPU 或远程 GpuInferService）。"""
@@ -393,6 +398,7 @@ def _eval_policy_and_factory(
             refocus,
             defer_logit,
             sticky_window,
+            sample=sample,
             infer_pool=client,
         )
         return policy, factory
@@ -404,7 +410,7 @@ def _eval_policy_and_factory(
     policy.to(device)
     policy.eval()
     factory = _make_eval_decider_factory(
-        policy, device, refocus, defer_logit, sticky_window
+        policy, device, refocus, defer_logit, sticky_window, sample=sample
     )
     return policy, factory
 
@@ -420,6 +426,7 @@ def _eval_test_worker(task: tuple) -> dict:
         refocus,
         defer_logit,
         sticky_window,
+        sample,
         use_remote,
     ) = task
     from omt_branching.solver.decide_omt import smt2_to_instance
@@ -439,6 +446,7 @@ def _eval_test_worker(task: tuple) -> dict:
         refocus,
         defer_logit,
         sticky_window,
+        sample=bool(sample),
         use_remote=bool(use_remote),
     )
     ln = solve_omt_with_decider(
@@ -469,6 +477,7 @@ def _eval_val_worker(task: tuple) -> dict:
         refocus,
         defer_logit,
         sticky_window,
+        sample,
         use_remote,
     ) = task
     from omt_branching.solver.decide_omt import smt2_to_instance
@@ -486,6 +495,7 @@ def _eval_val_worker(task: tuple) -> dict:
         refocus,
         defer_logit,
         sticky_window,
+        sample=bool(sample),
         use_remote=bool(use_remote),
     )
     ln = solve_omt_with_decider(
@@ -594,10 +604,14 @@ def _run_test_parallel(
     split: str = "test",
     defer_logit: float = 0.0,
     sticky_window: bool = False,
+    sample: bool = False,
     infer_service: GpuInferService | None = None,
     use_all_gpus: bool = True,
 ) -> list[dict]:
-    """并发跑测试集；workers>1 时 GNN 在主进程 GPU 上推理（与 RL collect 同构）。"""
+    """并发跑测试集；workers>1 时 GNN 在主进程 GPU 上推理（与 RL collect 同构）。
+
+    ``sample`` 默认 False（argmax）；True 时与 collect 同分布概率采样。
+    """
     n_workers = max(1, min(workers, len(entries)))
     # 多进程或复用训练期 GpuInferService 时走远程 GPU；单进程本地直接用 device
     use_remote = n_workers > 1 or infer_service is not None
@@ -619,6 +633,7 @@ def _run_test_parallel(
             refocus,
             float(defer_logit),
             bool(sticky_window),
+            bool(sample),
             use_remote,
         ))
     rows = _run_eval_tasks(
@@ -647,10 +662,14 @@ def _run_val_parallel(
     split: str = "eval",
     defer_logit: float = 0.0,
     sticky_window: bool = False,
+    sample: bool = True,
     infer_service: GpuInferService | None = None,
     use_all_gpus: bool = True,
 ) -> dict:
-    """在验证集上评估 learned 臂；workers>1 时 GNN 走主进程 GPU。"""
+    """在验证集上评估 learned 臂；workers>1 时 GNN 走主进程 GPU。
+
+    ``sample`` 默认 True（概率采样，与 collect 对齐）；False 为 argmax。
+    """
     if not entries:
         raise ValueError("验证集条目为空")
     n_workers = max(1, min(workers, len(entries)))
@@ -673,6 +692,7 @@ def _run_val_parallel(
             refocus,
             float(defer_logit),
             bool(sticky_window),
+            bool(sample),
             use_remote,
         ))
     rows = _run_eval_tasks(
@@ -800,6 +820,16 @@ def main() -> None:
         help="启用窗口粘性（默认关闭：每次 decide 采样/argmax 并记 step）",
     )
     ap.add_argument(
+        "--eval-argmax",
+        action="store_true",
+        help="验证集 learned 臂用 argmax（默认概率采样，与 collect 同分布）",
+    )
+    ap.add_argument(
+        "--test-sample",
+        action="store_true",
+        help="测试集 learned 臂用概率采样（默认 argmax）",
+    )
+    ap.add_argument(
         "--ckpt-dir",
         default=DEFAULT_CKPT_DIR,
         help="checkpoint 目录（imitation.pt 与 RL iter_*.pt 同目录）",
@@ -862,7 +892,13 @@ def main() -> None:
     print(f"GNN device: {device}")
     print(f"数据集目录: {dataset_dir}")
     sticky_window = bool(args.sticky_window)
+    eval_sample = not bool(args.eval_argmax)
+    test_sample = bool(args.test_sample)
     print(f"sticky_window={sticky_window}（验证/测试与训练一致）")
+    print(
+        f"eval 决策={'概率采样' if eval_sample else 'argmax'}；"
+        f"test 决策={'概率采样' if test_sample else 'argmax'}"
+    )
 
     z3_path = args.z3_path or shutil.which("z3")
     if not z3_path:
@@ -1136,7 +1172,8 @@ def main() -> None:
             print(
                 f"早停: eval={len(eval_entries)} 实例, metric=mean_reward↑, "
                 f"patience={early_cfg.patience}, tol={early_cfg.tol}, "
-                f"eval_every={early_cfg.eval_every}"
+                f"eval_every={early_cfg.eval_every}, "
+                f"sample={'on' if eval_sample else 'argmax'}"
                 + (
                     f", max_iters={early_cfg.max_iters}"
                     if args.rl_iters == -1
@@ -1155,6 +1192,7 @@ def main() -> None:
                     split="eval",
                     defer_logit=float(trainer.defer_logit.detach().cpu()),
                     sticky_window=sticky_window,
+                    sample=eval_sample,
                     # 与 RL collect 共用主进程 GPU 推理服务，避免再拷一份权重
                     infer_service=trainer._infer_service,
                 )
@@ -1254,6 +1292,7 @@ def main() -> None:
         args.test_workers,
         defer_logit=test_defer_logit,
         sticky_window=sticky_window,
+        sample=test_sample,
     )
     for row in rows:
         ref_val = row["ref_val"]
@@ -1304,6 +1343,8 @@ def main() -> None:
         "test_workers": args.test_workers,
         "defer_logit": test_defer_logit,
         "sticky_window": sticky_window,
+        "eval_sample": eval_sample,
+        "test_sample": test_sample,
         "per_instance": per_instance,
     }
     results_path = os.path.join(ARTIFACTS, "results.json")

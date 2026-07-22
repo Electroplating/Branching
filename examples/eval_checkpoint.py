@@ -1,14 +1,16 @@
 """加载已有策略权重，在数据集 test 划分上做四臂对比并写 ``results.json``。
 
-评测逻辑与 ``examples/decide_branch.py`` 一致（``SamplingPolicyDecider`` +
-``sample=False`` 允许 defer；ref 缓存参考），不训练。默认权重
-``examples/artifacts/rl_decide_policy.pt``，默认数据 ``examples/artifacts/dataset``。
+评测逻辑与 ``examples/decide_branch.py`` 一致（``SamplingPolicyDecider``；
+默认 ``sample=False``/argmax，``--test-sample`` 改为概率采样；允许 defer；
+ref 缓存参考），不训练。默认权重 ``examples/artifacts/rl_decide_policy.pt``，
+默认数据 ``examples/artifacts/dataset``。
 
 运行::
 
     python -m examples.eval_checkpoint
     python -m examples.eval_checkpoint --checkpoint examples/artifacts/rl_checkpoints/iter_0005.pt
     python -m examples.eval_checkpoint --dataset-dir path/to/dataset --out path/to/results.json
+    python -m examples.eval_checkpoint --test-sample
 """
 
 from __future__ import annotations
@@ -79,6 +81,11 @@ def main() -> None:
         help="启用窗口粘性（默认关闭，与 decide_branch 训练默认一致）",
     )
     ap.add_argument(
+        "--test-sample",
+        action="store_true",
+        help="测试集 learned 臂用概率采样（默认 argmax）",
+    )
+    ap.add_argument(
         "--defer-logit",
         type=float,
         default=None,
@@ -118,11 +125,15 @@ def main() -> None:
     else:
         defer_logit = float(meta.get("defer_logit", 0.0)) if meta else 0.0
     sticky_window = bool(args.sticky_window)
+    test_sample = bool(args.test_sample)
     if meta:
         print(
             f"已加载权重 meta keys={list(meta.keys())}, "
-            f"defer_logit={defer_logit}, sticky_window={sticky_window}"
+            f"defer_logit={defer_logit}, sticky_window={sticky_window}, "
+            f"test_sample={test_sample}"
         )
+    else:
+        print(f"sticky_window={sticky_window}, test_sample={test_sample}")
 
     _solver_arm = {
         "rlimit": 0.0,
@@ -162,6 +173,7 @@ def main() -> None:
         args.test_workers,
         defer_logit=defer_logit,
         sticky_window=sticky_window,
+        sample=test_sample,
     )
     for row in rows:
         ref_val = row["ref_val"]
@@ -220,6 +232,7 @@ def main() -> None:
         "per_instance": per_instance,
         "defer_logit": defer_logit,
         "sticky_window": sticky_window,
+        "test_sample": test_sample,
         # 评测专用溯源（decide_branch 无此字段）
         "checkpoint": str(ckpt_path.resolve()),
         "checkpoint_meta": {k: _json_value(v) for k, v in meta.items()},
