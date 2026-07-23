@@ -74,9 +74,9 @@ def solve_omt_with_decider(
     - ``attach_propagator=False``：不挂 propagator（check-sat-loop 臂）；忽略
       ``decider_factory`` / ``propagator_factory``。
     - 每次 better-cut 写入 Solver 后，若 decider 实现 ``add_hard``，会把 cut 并入 GNN
-      建图断言，并在**独立 Context** 上刷新根级 ``consequences`` 强制赋值（跨 cut
-      简化建图）；不额外 ``prop.add``：单元 cut 本就不作分支候选。consequences 的 rlimit
-      记入返回值 ``consequence rlimit``，**不计入**主搜索 ``rlimit`` /
+      建图断言，并在**独立持久 Context** 上增量刷新根级 ``consequences`` 强制赋值
+      （跨 cut 简化建图）；不额外 ``prop.add``：单元 cut 本就不作分支候选。consequences
+      的 rlimit 记入返回值 ``consequence rlimit``，**不计入**主搜索 ``rlimit`` /
       ``weighted rlimit``（RL 奖励默认用后者；完整代价见 ``rlimit with consequence``）。
 
     若给定 ``ref_rlimit``，当前消耗超出 ``2 * ref_rlimit`` 时提前返回（未达最优时

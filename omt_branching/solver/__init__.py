@@ -50,6 +50,7 @@ from omt_branching.solver.propagator_snapshot import (
     prepare_propagator_formula,
     preprocess_assertions,
     root_forced_assignment,
+    RootForcedTracker,
 )
 from omt_branching.solver.propagator import LearnedDecidePropagator
 from omt_branching.solver.policy_decider import PolicyDecider, solve_with_learned_policy
@@ -164,6 +165,7 @@ __all__ = [
     "collect_clause_atoms",
     "preprocess_assertions",
     "prepare_propagator_formula",
+    "RootForcedTracker",
     "root_forced_assignment",
     "merge_root_assignment",
     "merge_assignment_trail",

@@ -11,12 +11,11 @@
 建图动态投影（``assignment`` / ``trail`` / ``fixed``）：
 - :func:`build_bool_snapshot` 在非空赋值下做布尔单元传播闭包，再投影子句边、
   剪掉已定候选；``trail`` 保序写入 ``decision_level``（赋值先后时间戳）。
-- :func:`root_forced_assignment` —— OMT better-cut 后在根状态用 ``consequences``
-  求硬断言强制的原子赋值；经 :func:`merge_root_assignment` /
-  :func:`merge_assignment_trail` 并入搜索 trail，
-  供跨 cut 简化建图（剪掉根级已定候选 / 投影子句）。在**独立** ``z3.Context``
-  上求解，不污染主 Solver 的 ``rlimit``；自身消耗作为返回值第二项，由 decider
-  累计为 ``consequence rlimit``（与主搜索 ``rlimit`` 并列，RL 奖励默认不计入）。
+- :class:`RootForcedTracker` / :func:`root_forced_assignment` —— OMT better-cut 后在
+  根状态用 ``consequences`` 求硬断言强制的原子赋值；经 :func:`merge_root_assignment` /
+  :func:`merge_assignment_trail` 并入搜索 trail，供跨 cut 简化建图。在**持久、独立**
+  ``z3.Context`` 上增量 ``add`` cut / 扩充原子集，避免每次全量 translate+重建 Solver，
+  且不污染主 Solver 的 ``rlimit``；消耗由 decider 累计为 ``consequence rlimit``。
 
 性能：``atom_key`` 按 ``id(expr)`` 缓存；静态 snapshot LRU；``_linear`` 仅单次建图局部缓存。
 """
@@ -254,6 +253,130 @@ def _solver_rlimit(s) -> int:
     return 0
 
 
+class RootForcedTracker:
+    """独立 Context 上的增量根级 ``consequences`` 跟踪器。
+
+    与主 OMT Solver **隔离**：表达式经 ``translate`` 进入私有 Context，``rlimit``
+    只计在本 Solver。OMT 线性搜索的 better-cut 单调加强，因此：
+
+    - :meth:`seed` 一次性装入基硬约束（不跑 consequences）；
+    - :meth:`add` 只 ``translate``/``add`` 新 cut，并增量注册新原子后跑 consequences；
+    - 已 forced 的原子不再放入 probe，结果单调并入 :attr:`forced`。
+
+    失败时返回当前 ``forced`` 与 ``0`` 消耗（不影响主搜索）。
+    """
+
+    def __init__(self, *, max_atoms: Optional[int] = None):
+        self.max_atoms = max_atoms
+        self._ctx: Optional[z3.Context] = None
+        self._solver: Optional[z3.Solver] = None
+        # (主 Context atom_key, 独立 Context 上的原子表达式)
+        self._atoms_iso: list[tuple[str, object]] = []
+        self._atom_keys: set[str] = set()
+        self._forced: dict[str, bool] = {}
+        self._seeded: bool = False
+
+    @property
+    def forced(self) -> dict[str, bool]:
+        """当前累计的根级强制赋值（主 Context ``atom_key`` 口径）。"""
+        return self._forced
+
+    def seed(self, assertions, atoms=None) -> None:
+        """装入基硬约束到独立 Solver（不跑 consequences）。
+
+        ``atoms`` 非空时用作初始 probe；否则从 ``assertions`` 收集。
+        已 seed 后再次调用会抛 ``RuntimeError``。
+        """
+        if self._seeded:
+            raise RuntimeError("RootForcedTracker 已 seed，不能重复装入基断言")
+        self._ensure_solver()
+        assertions = list(assertions)
+        if assertions:
+            self._solver.add(*[a.translate(self._ctx) for a in assertions])
+            if atoms is not None:
+                self._register_atom_exprs(list(atoms))
+            else:
+                self._register_atoms_from(assertions)
+        elif atoms is not None:
+            self._register_atom_exprs(list(atoms))
+        self._seeded = True
+
+    def add(self, *exprs) -> tuple[dict[str, bool], int]:
+        """增量加入新断言（如 better-cut），更新原子集并跑 ``consequences``。
+
+        若尚未 :meth:`seed`，先以空基断言 seed。返回
+        ``(forced_assignment, 本次 consequence_rlimit)``。
+        """
+        if not exprs:
+            return dict(self._forced), 0
+        if not self._seeded:
+            self.seed([])
+        assert self._solver is not None and self._ctx is not None
+        new = list(exprs)
+        try:
+            self._solver.add(*[e.translate(self._ctx) for e in new])
+        except z3.Z3Exception:
+            return dict(self._forced), 0
+        self._register_atoms_from(new)
+        return self._run_consequences()
+
+    def refresh(self) -> tuple[dict[str, bool], int]:
+        """不增加断言，仅对当前 Solver 状态跑 ``consequences``。"""
+        if not self._seeded:
+            return {}, 0
+        return self._run_consequences()
+
+    def _ensure_solver(self) -> None:
+        if self._ctx is None:
+            self._ctx = z3.Context()
+            self._solver = z3.Solver(ctx=self._ctx)
+
+    def _at_atom_cap(self) -> bool:
+        return self.max_atoms is not None and len(self._atoms_iso) >= max(
+            0, int(self.max_atoms)
+        )
+
+    def _register_atom_exprs(self, atom_exprs) -> None:
+        """把主 Context 原子 translate 进 probe（按 ``atom_key`` 去重）。"""
+        assert self._ctx is not None
+        for a in atom_exprs:
+            if self._at_atom_cap():
+                break
+            k = atom_key(a)
+            if k in self._atom_keys:
+                continue
+            try:
+                self._atoms_iso.append((k, a.translate(self._ctx)))
+            except z3.Z3Exception:
+                continue
+            self._atom_keys.add(k)
+
+    def _register_atoms_from(self, exprs) -> None:
+        self._register_atom_exprs(collect_atoms(list(exprs)))
+
+    def _probe_atoms(self) -> list:
+        """尚未 forced 的 probe 原子（已 forced 的键跳过）。"""
+        return [a for k, a in self._atoms_iso if k not in self._forced]
+
+    def _run_consequences(self) -> tuple[dict[str, bool], int]:
+        assert self._solver is not None
+        probe = self._probe_atoms()
+        if not probe:
+            return dict(self._forced), 0
+        # iso 表达式 atom_key -> 注册时的主 Context 键（通常相同，显式映射更稳）
+        iso_to_main = {atom_key(a): k for k, a in self._atoms_iso}
+        try:
+            r0 = _solver_rlimit(self._solver)
+            _res, imps = self._solver.consequences([], probe)
+            r1 = _solver_rlimit(self._solver)
+            newly = _consequence_literal_assignment(imps)
+            for ik, val in newly.items():
+                self._forced[iso_to_main.get(ik, ik)] = val
+            return dict(self._forced), max(0, r1 - r0)
+        except z3.Z3Exception:
+            return dict(self._forced), 0
+
+
 def root_forced_assignment(
     assertions,
     atoms=None,
@@ -262,34 +385,19 @@ def root_forced_assignment(
 ) -> tuple[dict[str, bool], int]:
     """根状态（无决策假设）下，用 z3 ``consequences`` 求被硬断言强制的原子赋值。
 
-    典型用途：OMT 线性搜索每次 better-cut 并入断言后，刷新根级 forced 集合，
-    再经 :func:`merge_root_assignment` 喂给 :func:`build_bool_snapshot`，投影子句并
-    剪掉已定候选。失败或无原子时返回 ``({}, 0)``（不影响后续求解）。
+    一次性便捷接口：内部新建 :class:`RootForcedTracker`，``seed`` 全部断言后
+    ``refresh``。OMT 多轮 better-cut 请持有 ``RootForcedTracker`` 做增量 ``add``，
+    避免全量重算。
 
-    在**独立** :class:`z3.Context` 上 ``translate`` 后求解，避免与主 OMT Solver
-    共享 Context 导致 ``rlimit count`` 被计入主搜索。返回
-    ``(forced_assignment, consequence_rlimit)``，后者仅反映本次 consequences 消耗。
+    在**独立** :class:`z3.Context` 上求解，不污染主 Solver ``rlimit``。返回
+    ``(forced_assignment, consequence_rlimit)``。失败或无原子时返回 ``({}, 0)``。
     """
     assertions = list(assertions)
     if not assertions:
         return {}, 0
-    atom_exprs = list(atoms) if atoms is not None else collect_atoms(assertions)
-    if max_atoms is not None:
-        atom_exprs = atom_exprs[: max(0, int(max_atoms))]
-    if not atom_exprs:
-        return {}, 0
-    ctx = z3.Context()
-    try:
-        as_iso = [a.translate(ctx) for a in assertions]
-        atoms_iso = [a.translate(ctx) for a in atom_exprs]
-        s = z3.Solver(ctx=ctx)
-        s.add(*as_iso)
-        r0 = _solver_rlimit(s)
-        _res, imps = s.consequences([], atoms_iso)
-        r1 = _solver_rlimit(s)
-        return _consequence_literal_assignment(imps), max(0, r1 - r0)
-    except z3.Z3Exception:
-        return {}, 0
+    tracker = RootForcedTracker(max_atoms=max_atoms)
+    tracker.seed(assertions, atoms=atoms)
+    return tracker.refresh()
 
 
 def merge_root_assignment(
@@ -730,6 +838,7 @@ __all__ = [
     "collect_clause_atoms",
     "preprocess_assertions",
     "prepare_propagator_formula",
+    "RootForcedTracker",
     "root_forced_assignment",
     "merge_root_assignment",
     "merge_assignment_trail",

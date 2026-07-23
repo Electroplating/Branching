@@ -3,6 +3,7 @@ import pytest
 z3 = pytest.importorskip("z3")
 
 from omt_branching.solver.propagator_snapshot import (
+    RootForcedTracker,
     atom_key,
     collect_atoms,
     collect_clause_atoms,
@@ -250,6 +251,34 @@ def test_root_forced_assignment_after_cut():
     cand = set(snap.candidate_bool_ids or [])
     assert atom_key(a) not in cand
     assert atom_key(b) not in cand
+
+
+def test_root_forced_tracker_incremental_cuts():
+    """持久独立 Context：多次 add cut 只增量加强，forced 单调且与一次性接口一致。"""
+    clear_bool_snapshot_cache()
+    x = z3.Int("x")
+    a, b = x >= 5, x <= 2
+    asserts = [x >= 0, x <= 10, z3.Or(a, b)]
+    tr = RootForcedTracker()
+    tr.seed(asserts)
+    assert tr.forced == {}
+
+    f1, c1 = tr.add(x >= 6)
+    assert c1 >= 0
+    assert f1.get(atom_key(a)) is True
+    assert f1.get(atom_key(b)) is False
+    n_atoms_after_first = len(tr._atoms_iso)
+
+    f2, c2 = tr.add(x >= 7)
+    assert c2 >= 0
+    assert f2.get(atom_key(a)) is True
+    assert f2.get(atom_key(b)) is False
+    # 第二次不应因全量重建而丢原子；新 cut 可能不引入新布尔原子
+    assert len(tr._atoms_iso) >= n_atoms_after_first
+    # 与一次性 seed+cut 结果一致
+    one_shot, _ = root_forced_assignment(asserts + [x >= 6, x >= 7])
+    assert one_shot.get(atom_key(a)) == f2.get(atom_key(a))
+    assert one_shot.get(atom_key(b)) == f2.get(atom_key(b))
 
 
 def test_merge_root_assignment_trail_overrides():

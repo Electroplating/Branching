@@ -29,9 +29,9 @@ def test_refocus_cadence():
     calls = {"n": 0}
     orig = dec._refocus
 
-    def counting(asg):
+    def counting(asg, trail=None):
         calls["n"] += 1
-        return orig(asg)
+        return orig(asg, trail)
 
     dec._refocus = counting
     for _ in range(7):
@@ -77,14 +77,14 @@ def test_add_hard_refreshes_root_fixed_for_graph():
     seen = {}
     orig = dec._refocus
 
-    def wrap(asg):
+    def wrap(asg, trail=None):
         merged = merge_root_assignment(dec._root_fixed, asg)
         seen["merged"] = dict(merged)
         snap, _ = build_bool_snapshot(dec.assertions, assignment=merged)
         seen["cand"] = list(snap.candidate_bool_ids or [])
         g = GraphBuilder().build(snap)
         seen["lit_edges"] = g.num_edges(EdgeType.LITERAL_IN_CLAUSE)
-        return orig(asg)
+        return orig(asg, trail)
 
     dec._refocus = wrap
     dec([atom_key(a), atom_key(b)], {})
@@ -102,9 +102,9 @@ def test_on_backtrack_forces_immediate_refocus():
     calls = {"n": 0}
     orig = dec._refocus
 
-    def counting(asg):
+    def counting(asg, trail=None):
         calls["n"] += 1
-        return orig(asg)
+        return orig(asg, trail)
 
     dec._refocus = counting
     dec([atom_key(x >= 5)], {})  # 首次 refocus
